@@ -16,7 +16,7 @@ jobs:
   #    name: Build extension binaries
   #    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
   #    with:
-  #      duckdb_version: main
+  #      duckdb_version: v1.4-andium
   #      ci_tools_version: main
   #      extension_name: redis
   #      exclude_archs: 'wasm_mvp;wasm_threads;wasm_eh'
@@ -25,7 +25,7 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: main
+      duckdb_version: v1.4-andium
       ci_tools_version: main
       extension_name: redis
       exclude_archs: "wasm_mvp;wasm_threads;wasm_eh"
