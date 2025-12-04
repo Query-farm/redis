@@ -2,13 +2,14 @@
 
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
-#include "duckdb/main/extension_util.hpp"
 
 namespace duckdb {
 
+class ExtensionLoader;
+
 class CreateRedisSecretFunctions {
 public:
-    static void Register(DatabaseInstance &instance);
+    static void Register(ExtensionLoader &loader);
 };
 
 } // namespace duckdb 

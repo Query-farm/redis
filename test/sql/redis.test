@@ -1,0 +1,108 @@
+# name: test/sql/redis.test
+# description: test redis extension
+# group: [redis]
+
+# Require statement will ensure this test is run with this extension loaded
+require redis
+
+# Test that scalar functions exist and have proper error handling for missing secrets
+statement error
+SELECT redis_get('mykey', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_set('mykey', 'myvalue', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_hget('myhash', 'field1', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_hset('myhash', 'field1', 'value1', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_lpush('mylist', 'value1', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_lrange('mylist', 0, -1, 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_mget('key1,key2', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_scan('0', '*', 100, 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_hscan('myhash', '0', '*', 100, 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_del('mykey', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_exists('mykey', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_type('mykey', 'nonexistent_secret');
+----
+Redis secret not found
+
+# Test table functions exist and have proper error handling for missing secrets
+statement error
+SELECT * FROM redis_keys('*', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT * FROM redis_hgetall('myhash', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT * FROM redis_lrange_table('mylist', 0, -1, 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT * FROM redis_hscan_over_scan('*', '*', 100, 'nonexistent_secret');
+----
+Redis secret not found
+
+# Test that we can create a redis secret
+statement ok
+CREATE SECRET my_test_secret (
+    TYPE redis,
+    HOST 'localhost',
+    PORT '6379',
+    PASSWORD ''
+);
+
+# Test that the secret is properly created (connection will fail but secret exists)
+# This tests that the secret lookup works - the connection error proves we found the secret
+statement error
+SELECT redis_get('mykey', 'my_test_secret');
+----
+Redis connection error
+
+# Cleanup
+statement ok
+DROP SECRET my_test_secret;
