@@ -7,7 +7,7 @@
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/function/table_function.hpp"
-
+#include "duckdb/main/extension/extension_loader.hpp"
 #include <boost/asio.hpp>
 #include <string>
 #include <mutex>
@@ -1023,4 +1023,8 @@ std::string RedisExtension::Version() const {
 
 } // namespace duckdb
 
-DUCKDB_CPP_EXTENSION_ENTRY(redis, duckdb::RedisExtension)
+extern "C" {
+DUCKDB_CPP_EXTENSION_ENTRY(redis, loader) {
+	duckdb::LoadInternal(loader);
+}
+}
