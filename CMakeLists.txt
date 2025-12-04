@@ -16,9 +16,10 @@ include_directories(
 )
 
 # Add redis_secret.cpp to the sources
-set(EXTENSION_SOURCES 
+set(EXTENSION_SOURCES
     src/redis_extension.cpp
     src/redis_secret.cpp
+    src/query_farm_telemetry.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
