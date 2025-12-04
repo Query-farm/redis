@@ -4,8 +4,9 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension_util.hpp"
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "duckdb/main/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/function/table_function.hpp"
 
 #include <boost/asio.hpp>
@@ -228,7 +229,7 @@ static bool GetRedisSecret(ClientContext &context, const string &secret_name, st
     auto &secret_manager = SecretManager::Get(context);
     try {
         auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-        auto secret_match = secret_manager.LookupSecret(transaction, "redis", secret_name);
+        auto secret_match = secret_manager.LookupSecret(transaction, secret_name, "redis");
         if (secret_match.HasMatch()) {
             auto &secret = secret_match.GetSecret();
             if (secret.GetType() != "redis") {
@@ -855,195 +856,179 @@ static void RedisTypeFunction(DataChunk &args, ExpressionState &state, Vector &r
         });
 }
 
-static void LoadInternal(DatabaseInstance &instance) {
+static void LoadInternal(ExtensionLoader &loader) {
     // Register the secret functions first!
-    CreateRedisSecretFunctions::Register(instance);
+    CreateRedisSecretFunctions::Register(loader);
 
-    // Then register Redis functions
-    auto redis_get_func = ScalarFunction(
-        "redis_get",
-        {LogicalType::VARCHAR,    // key
-         LogicalType::VARCHAR},   // secret_name
-        LogicalType::VARCHAR,
-        RedisGetFunction
-    );
-    ExtensionUtil::RegisterFunction(instance, redis_get_func);
+    // Helper to add description to a scalar function
+    auto add_scalar_function = [&](ScalarFunction func, const string &description,
+                                   const vector<string> &param_names, const vector<string> &examples,
+                                   const string &category = "redis") {
+        CreateScalarFunctionInfo info(std::move(func));
+        FunctionDescription func_desc;
+        func_desc.description = description;
+        func_desc.parameter_names = param_names;
+        func_desc.examples = examples;
+        func_desc.categories = {category};
+        info.descriptions.push_back(std::move(func_desc));
+        loader.RegisterFunction(std::move(info));
+    };
 
-    // Register Redis SET function
-    auto redis_set_func = ScalarFunction(
-        "redis_set",
-        {LogicalType::VARCHAR,    // key
-         LogicalType::VARCHAR,    // value
-         LogicalType::VARCHAR},   // secret_name
-        LogicalType::VARCHAR,
-        RedisSetFunction
-    );
-    ExtensionUtil::RegisterFunction(instance, redis_set_func);
+    // Helper to add description to a table function
+    auto add_table_function = [&](TableFunction func, const string &description,
+                                  const vector<string> &param_names, const vector<string> &examples,
+                                  const string &category = "redis") {
+        CreateTableFunctionInfo info(std::move(func));
+        FunctionDescription func_desc;
+        func_desc.description = description;
+        func_desc.parameter_names = param_names;
+        func_desc.examples = examples;
+        func_desc.categories = {category};
+        info.descriptions.push_back(std::move(func_desc));
+        loader.RegisterFunction(std::move(info));
+    };
 
-    // Register HGET
-    auto redis_hget_func = ScalarFunction(
-        "redis_hget",
-        {LogicalType::VARCHAR,    // key
-         LogicalType::VARCHAR,    // field
-         LogicalType::VARCHAR},   // secret_name
-        LogicalType::VARCHAR,
-        RedisHGetFunction
+    // Register redis_get scalar function
+    add_scalar_function(
+        ScalarFunction("redis_get", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisGetFunction),
+        "Get the value of a key from Redis. Returns the value associated with the specified key, or an empty string if the key does not exist.",
+        {"key", "secret_name"},
+        {"SELECT redis_get('mykey', 'my_redis_secret');", "SELECT redis_get(key_column, 'my_redis_secret') FROM my_table;"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_hget_func);
 
-    // Register HSET
-    auto redis_hset_func = ScalarFunction(
-        "redis_hset",
-        {LogicalType::VARCHAR,    // key
-         LogicalType::VARCHAR,    // field
-         LogicalType::VARCHAR,    // value
-         LogicalType::VARCHAR},   // secret_name
-        LogicalType::VARCHAR,
-        RedisHSetFunction
+    // Register redis_set scalar function
+    add_scalar_function(
+        ScalarFunction("redis_set", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisSetFunction),
+        "Set the value of a key in Redis. Returns 'OK' on success.",
+        {"key", "value", "secret_name"},
+        {"SELECT redis_set('mykey', 'myvalue', 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_hset_func);
 
-    // Register LPUSH
-    auto redis_lpush_func = ScalarFunction(
-        "redis_lpush",
-        {LogicalType::VARCHAR,    // key
-         LogicalType::VARCHAR,    // value
-         LogicalType::VARCHAR},   // secret_name
-        LogicalType::VARCHAR,
-        RedisLPushFunction
+    // Register redis_hget scalar function
+    add_scalar_function(
+        ScalarFunction("redis_hget", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisHGetFunction),
+        "Get the value of a field in a Redis hash. Returns the value associated with the field, or an empty string if the field does not exist.",
+        {"key", "field", "secret_name"},
+        {"SELECT redis_hget('myhash', 'field1', 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_lpush_func);
 
-    // Register LRANGE
-    auto redis_lrange_func = ScalarFunction(
-        "redis_lrange",
-        {LogicalType::VARCHAR,    // key
-         LogicalType::BIGINT,     // start
-         LogicalType::BIGINT,     // stop
-         LogicalType::VARCHAR},   // secret_name
-        LogicalType::VARCHAR,
-        RedisLRangeFunction
+    // Register redis_hset scalar function
+    add_scalar_function(
+        ScalarFunction("redis_hset", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisHSetFunction),
+        "Set the value of a field in a Redis hash. Returns the number of fields that were added (0 if the field existed and was updated, 1 if it was created).",
+        {"key", "field", "value", "secret_name"},
+        {"SELECT redis_hset('myhash', 'field1', 'value1', 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_lrange_func);
 
-    // Register MGET
-    auto redis_mget_func = ScalarFunction(
-        "redis_mget",
-        {LogicalType::VARCHAR,    // comma-separated keys
-         LogicalType::VARCHAR},   // secret_name
-        LogicalType::VARCHAR,
-        RedisMGetFunction
+    // Register redis_lpush scalar function
+    add_scalar_function(
+        ScalarFunction("redis_lpush", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisLPushFunction),
+        "Prepend a value to a Redis list. Returns the length of the list after the push operation.",
+        {"key", "value", "secret_name"},
+        {"SELECT redis_lpush('mylist', 'value1', 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_mget_func);
 
-    // Register SCAN
-    auto redis_scan_func = ScalarFunction(
-        "redis_scan",
-        {LogicalType::VARCHAR,    // cursor
-         LogicalType::VARCHAR,    // pattern
-         LogicalType::BIGINT,     // count
-         LogicalType::VARCHAR},   // secret_name
-        LogicalType::VARCHAR,
-        RedisScanFunction
+    // Register redis_lrange scalar function
+    add_scalar_function(
+        ScalarFunction("redis_lrange", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisLRangeFunction),
+        "Get a range of elements from a Redis list. Returns elements as a comma-separated string. Use 0 for start and -1 for stop to get all elements.",
+        {"key", "start", "stop", "secret_name"},
+        {"SELECT redis_lrange('mylist', 0, -1, 'my_redis_secret');", "SELECT redis_lrange('mylist', 0, 10, 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_scan_func);
 
-    // Register HSCAN
-    auto redis_hscan_func = ScalarFunction(
-        "redis_hscan",
-        {
-            LogicalType::VARCHAR, // key
-            LogicalType::VARCHAR, // cursor
-            LogicalType::VARCHAR, // pattern
-            LogicalType::BIGINT,  // count
-            LogicalType::VARCHAR  // secret_name
-        },
-        LogicalType::VARCHAR,
-        RedisHScanFunction
+    // Register redis_mget scalar function
+    add_scalar_function(
+        ScalarFunction("redis_mget", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisMGetFunction),
+        "Get the values of multiple keys from Redis. Keys should be comma-separated. Returns values as a comma-separated string.",
+        {"keys", "secret_name"},
+        {"SELECT redis_mget('key1,key2,key3', 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_hscan_func);
 
-    // Register redis_hscan_over_scan table function
-    TableFunction redis_hscan_over_scan_func(
-        "redis_hscan_over_scan",
-        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR},
-        RedisHScanOverScanFunction,
-        RedisHScanOverScanBind
+    // Register redis_scan scalar function
+    add_scalar_function(
+        ScalarFunction("redis_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisScanFunction),
+        "Incrementally iterate over keys in Redis matching a pattern. Returns 'cursor:key1,key2,...'. Use cursor '0' to start, and continue until cursor returns '0'.",
+        {"cursor", "pattern", "count", "secret_name"},
+        {"SELECT redis_scan('0', '*', 100, 'my_redis_secret');", "SELECT redis_scan('0', 'user:*', 10, 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_hscan_over_scan_func);
 
-    // Register redis_keys table function
-    TableFunction redis_keys_func(
-        "redis_keys",
-        {LogicalType::VARCHAR, LogicalType::VARCHAR},
-        RedisKeysFunction,
-        RedisKeysBind
+    // Register redis_hscan scalar function
+    add_scalar_function(
+        ScalarFunction("redis_hscan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisHScanFunction),
+        "Incrementally iterate over fields in a Redis hash matching a pattern. Returns 'cursor:field1=value1,field2=value2,...'.",
+        {"key", "cursor", "pattern", "count", "secret_name"},
+        {"SELECT redis_hscan('myhash', '0', '*', 100, 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_keys_func);
-
-    // Register redis_hgetall table function
-    TableFunction redis_hgetall_func(
-        "redis_hgetall",
-        {LogicalType::VARCHAR, LogicalType::VARCHAR},
-        RedisHGetAllFunction,
-        RedisHGetAllBind
-    );
-    ExtensionUtil::RegisterFunction(instance, redis_hgetall_func);
-
-    // Register redis_lrange_table table function
-    TableFunction redis_lrange_table_func(
-        "redis_lrange_table",
-        {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR},
-        RedisLRangeTableFunction,
-        RedisLRangeTableBind
-    );
-    ExtensionUtil::RegisterFunction(instance, redis_lrange_table_func);
 
     // Register redis_del scalar function
-    auto redis_del_func = ScalarFunction(
-        "redis_del",
-        {LogicalType::VARCHAR, LogicalType::VARCHAR},
-        LogicalType::BOOLEAN,
-        RedisDelFunction
+    add_scalar_function(
+        ScalarFunction("redis_del", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN, RedisDelFunction),
+        "Delete a key from Redis. Returns true if the key was deleted, false if it did not exist.",
+        {"key", "secret_name"},
+        {"SELECT redis_del('mykey', 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_del_func);
 
     // Register redis_exists scalar function
-    auto redis_exists_func = ScalarFunction(
-        "redis_exists",
-        {LogicalType::VARCHAR, LogicalType::VARCHAR},
-        LogicalType::BOOLEAN,
-        RedisExistsFunction
+    add_scalar_function(
+        ScalarFunction("redis_exists", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN, RedisExistsFunction),
+        "Check if a key exists in Redis. Returns true if the key exists, false otherwise.",
+        {"key", "secret_name"},
+        {"SELECT redis_exists('mykey', 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_exists_func);
 
     // Register redis_type scalar function
-    auto redis_type_func = ScalarFunction(
-        "redis_type",
-        {LogicalType::VARCHAR, LogicalType::VARCHAR},
-        LogicalType::VARCHAR,
-        RedisTypeFunction
+    add_scalar_function(
+        ScalarFunction("redis_type", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, RedisTypeFunction),
+        "Get the type of a key in Redis. Returns the type as a string (string, list, set, zset, hash, stream) or 'none' if the key does not exist.",
+        {"key", "secret_name"},
+        {"SELECT redis_type('mykey', 'my_redis_secret');"}
     );
-    ExtensionUtil::RegisterFunction(instance, redis_type_func);
+
+    // Register redis_keys table function
+    add_table_function(
+        TableFunction("redis_keys", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RedisKeysFunction, RedisKeysBind),
+        "Scan all keys in Redis matching a pattern. Returns a table with a single 'key' column containing all matching keys.",
+        {"pattern", "secret_name"},
+        {"SELECT * FROM redis_keys('*', 'my_redis_secret');", "SELECT * FROM redis_keys('user:*', 'my_redis_secret');"}
+    );
+
+    // Register redis_hgetall table function
+    add_table_function(
+        TableFunction("redis_hgetall", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RedisHGetAllFunction, RedisHGetAllBind),
+        "Get all fields and values from a Redis hash. Returns a table with 'field' and 'value' columns.",
+        {"key", "secret_name"},
+        {"SELECT * FROM redis_hgetall('myhash', 'my_redis_secret');"}
+    );
+
+    // Register redis_lrange_table table function
+    add_table_function(
+        TableFunction("redis_lrange_table", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR}, RedisLRangeTableFunction, RedisLRangeTableBind),
+        "Get a range of elements from a Redis list as a table. Returns a table with 'index' and 'value' columns.",
+        {"key", "start", "stop", "secret_name"},
+        {"SELECT * FROM redis_lrange_table('mylist', 0, -1, 'my_redis_secret');"}
+    );
+
+    // Register redis_hscan_over_scan table function
+    add_table_function(
+        TableFunction("redis_hscan_over_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, RedisHScanOverScanFunction, RedisHScanOverScanBind),
+        "Scan all hash keys matching a pattern, then scan fields within each hash. Returns a table with 'key', 'field', and 'value' columns. Useful for iterating over multiple hashes at once.",
+        {"scan_pattern", "hscan_pattern", "count", "secret_name"},
+        {"SELECT * FROM redis_hscan_over_scan('user:*', '*', 100, 'my_redis_secret');"}
+    );
 }
 
-void RedisExtension::Load(DuckDB &db) {
-    LoadInternal(*db.instance);
+void RedisExtension::Load(ExtensionLoader &loader) {
+    LoadInternal(loader);
 }
 
 std::string RedisExtension::Name() {
     return "redis";
 }
 
+std::string RedisExtension::Version() const {
+    return "2025120401";
+}
+
 } // namespace duckdb
 
-extern "C" {
-DUCKDB_EXTENSION_API void redis_init(duckdb::DatabaseInstance &db) {
-    duckdb::DuckDB db_wrapper(db);
-    db_wrapper.LoadExtension<duckdb::RedisExtension>();
-}
-
-DUCKDB_EXTENSION_API const char *redis_version() {
-    return duckdb::DuckDB::LibraryVersion();
-}
-} 
+DUCKDB_CPP_EXTENSION_ENTRY(redis, duckdb::RedisExtension) 

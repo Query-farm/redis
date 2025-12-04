@@ -1,7 +1,7 @@
 #include "redis_secret.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/secret/secret.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension_loader.hpp"
 
 namespace duckdb {
 
@@ -36,7 +36,7 @@ static unique_ptr<BaseSecret> CreateRedisSecretFromConfig(ClientContext &context
     // Redact sensitive keys
     RedactCommonKeys(*result);
 
-    return std::move(result);
+    return result;
 }
 
 static unique_ptr<BaseSecret> RedisSecretDeserialize(Deserializer &deserializer, BaseSecret base_secret) {
@@ -45,10 +45,10 @@ static unique_ptr<BaseSecret> RedisSecretDeserialize(Deserializer &deserializer,
     if (kv_secret) {
         RedactCommonKeys(*kv_secret);
     }
-    return std::move(result);
+    return result;
 }
 
-void CreateRedisSecretFunctions::Register(DatabaseInstance &instance) {
+void CreateRedisSecretFunctions::Register(ExtensionLoader &loader) {
     string type = "redis";
 
     // Register the new type
@@ -56,12 +56,12 @@ void CreateRedisSecretFunctions::Register(DatabaseInstance &instance) {
     secret_type.name = type;
     secret_type.deserializer = RedisSecretDeserialize;
     secret_type.default_provider = "config";
-    ExtensionUtil::RegisterSecretType(instance, secret_type);
+    loader.RegisterSecretType(secret_type);
 
     // Register the config secret provider
     CreateSecretFunction config_function = {type, "config", CreateRedisSecretFromConfig};
     RegisterCommonSecretParameters(config_function);
-    ExtensionUtil::RegisterFunction(instance, config_function);
+    loader.RegisterFunction(config_function);
 }
 
 } // namespace duckdb 
