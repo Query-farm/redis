@@ -150,6 +150,35 @@ public:
 		}
 		return cmd;
 	}
+
+	static std::string formatExpire(const std::string &key, int64_t seconds) {
+		return "*3\r\n$6\r\nEXPIRE\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n$" +
+		       std::to_string(std::to_string(seconds).length()) + "\r\n" + std::to_string(seconds) + "\r\n";
+	}
+
+	static std::string formatExpireAt(const std::string &key, int64_t timestamp) {
+		return "*3\r\n$8\r\nEXPIREAT\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n$" +
+		       std::to_string(std::to_string(timestamp).length()) + "\r\n" + std::to_string(timestamp) + "\r\n";
+	}
+
+	static std::string formatTtl(const std::string &key) {
+		return "*2\r\n$3\r\nTTL\r\n$" + std::to_string(key.length()) + "\r\n" + key + "\r\n";
+	}
+
+	static int64_t parseIntegerResponse(const std::string &response) {
+		if (response.empty() || response[0] != ':') {
+			throw InvalidInputException("Invalid Redis integer response");
+		}
+		size_t end = response.find("\r\n");
+		if (end == std::string::npos) {
+			throw InvalidInputException("Invalid Redis integer response");
+		}
+		try {
+			return std::stoll(response.substr(1, end - 1));
+		} catch (const std::exception &e) {
+			throw InvalidInputException("Failed to parse Redis integer response: %s", e.what());
+		}
+	}
 };
 
 // Redis connection class
@@ -845,6 +874,78 @@ static void RedisTypeFunction(DataChunk &args, ExpressionState &state, Vector &r
 	});
 }
 
+static void RedisExpireFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &key_vector = args.data[0];
+	auto &seconds_vector = args.data[1];
+	auto &secret_vector = args.data[2];
+
+	// Extract secret once before executor loop (optimization)
+	string host, port, password;
+	if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
+		throw InvalidInputException("Redis secret not found");
+	}
+	auto conn = ConnectionPool::getInstance().getConnection(host, port, password);
+
+	BinaryExecutor::Execute<string_t, int64_t, bool>(
+	    key_vector, seconds_vector, result, args.size(), [&](string_t key, int64_t seconds) {
+		    try {
+			    auto response = conn->execute(RedisProtocol::formatExpire(key.GetString(), seconds));
+			    auto result_int = RedisProtocol::parseIntegerResponse(response);
+			    // Returns 1 if TTL was set (key exists), 0 if key doesn't exist
+			    return result_int == 1;
+		    } catch (std::exception &e) {
+			    throw InvalidInputException("Redis EXPIRE error: %s", e.what());
+		    }
+	    });
+}
+
+static void RedisTTLFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &key_vector = args.data[0];
+	auto &secret_vector = args.data[1];
+
+	// Extract secret once before executor loop (optimization)
+	string host, port, password;
+	if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
+		throw InvalidInputException("Redis secret not found");
+	}
+	auto conn = ConnectionPool::getInstance().getConnection(host, port, password);
+
+	UnaryExecutor::Execute<string_t, int64_t>(key_vector, result, args.size(), [&](string_t key) {
+		try {
+			auto response = conn->execute(RedisProtocol::formatTtl(key.GetString()));
+			// Returns: -2 if key doesn't exist, -1 if key has no expiry, or positive TTL in seconds
+			return RedisProtocol::parseIntegerResponse(response);
+		} catch (std::exception &e) {
+			throw InvalidInputException("Redis TTL error: %s", e.what());
+		}
+	});
+}
+
+static void RedisExpireAtFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &key_vector = args.data[0];
+	auto &timestamp_vector = args.data[1];
+	auto &secret_vector = args.data[2];
+
+	// Extract secret once before executor loop (optimization)
+	string host, port, password;
+	if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
+		throw InvalidInputException("Redis secret not found");
+	}
+	auto conn = ConnectionPool::getInstance().getConnection(host, port, password);
+
+	BinaryExecutor::Execute<string_t, int64_t, bool>(
+	    key_vector, timestamp_vector, result, args.size(), [&](string_t key, int64_t timestamp) {
+		    try {
+			    auto response = conn->execute(RedisProtocol::formatExpireAt(key.GetString(), timestamp));
+			    auto result_int = RedisProtocol::parseIntegerResponse(response);
+			    // Returns 1 if expiry was set (key exists), 0 if key doesn't exist
+			    return result_int == 1;
+		    } catch (std::exception &e) {
+			    throw InvalidInputException("Redis EXPIREAT error: %s", e.what());
+		    }
+	    });
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// Register the secret functions first!
 	CreateRedisSecretFunctions::Register(loader);
@@ -972,6 +1073,36 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                    "stream) or 'none' if the key does not exist.",
 	                    {"key", "secret_name"}, {"SELECT redis_type('mykey', 'my_redis_secret');"});
 
+	// Register redis_expire scalar function
+	add_scalar_function(
+	    ScalarFunction("redis_expire", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR},
+	                   LogicalType::BOOLEAN, RedisExpireFunction),
+	    "Set a time-to-live (TTL) in seconds for a key. Returns true if the TTL was set, false if the key does not exist.",
+	    {"key", "seconds", "secret_name"},
+	    {"SELECT redis_expire('mykey', 3600, 'my_redis_secret');",
+	     "SELECT redis_expire('session:' || id, 300, 'my_redis_secret') FROM users;"});
+
+	// Register redis_ttl scalar function
+	add_scalar_function(ScalarFunction("redis_ttl", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
+	                                   RedisTTLFunction),
+	                    "Get the remaining time-to-live (TTL) of a key in seconds. Returns -2 if the key does not exist, "
+	                    "-1 if the key exists but has no expiry set.",
+	                    {"key", "secret_name"},
+	                    {"SELECT redis_ttl('mykey', 'my_redis_secret');",
+	                     "SELECT key, redis_ttl(key, 'my_redis_secret') FROM (SELECT redis_get(key) as key FROM "
+	                     "redis_keys('*', 'my_redis_secret')); "});
+
+	// Register redis_expireat scalar function
+	add_scalar_function(
+	    ScalarFunction("redis_expireat", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR},
+	                   LogicalType::BOOLEAN, RedisExpireAtFunction),
+	    "Set an expiry time (Unix timestamp) for a key. Returns true if the expiry was set, false if the key does not "
+	    "exist.",
+	    {"key", "timestamp", "secret_name"},
+	    {"SELECT redis_expireat('mykey', 1736918400, 'my_redis_secret');",
+	     "SELECT redis_expireat('event:' || id, EXTRACT(EPOCH FROM (event_time + INTERVAL '1 day'))::BIGINT, "
+	     "'my_redis_secret') FROM events;"});
+
 	// Register redis_keys table function
 	add_table_function(
 	    TableFunction("redis_keys", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RedisKeysFunction, RedisKeysBind),
@@ -1006,7 +1137,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"scan_pattern", "hscan_pattern", "count", "secret_name"},
 	    {"SELECT * FROM redis_hscan_over_scan('user:*', '*', 100, 'my_redis_secret');"});
 
-	QueryFarmSendTelemetry(loader, "redis", "2025120401");
+	QueryFarmSendTelemetry(loader, "redis", "2026011401");
 }
 
 void RedisExtension::Load(ExtensionLoader &loader) {
@@ -1018,7 +1149,7 @@ std::string RedisExtension::Name() {
 }
 
 std::string RedisExtension::Version() const {
-	return "2025120401";
+	return "2026011401";
 }
 
 } // namespace duckdb
