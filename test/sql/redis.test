@@ -87,6 +87,21 @@ SELECT * FROM redis_hscan_over_scan('*', '*', 100, 'nonexistent_secret');
 ----
 Redis secret not found
 
+statement error
+SELECT redis_expire('mykey', 3600, 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_ttl('mykey', 'nonexistent_secret');
+----
+Redis secret not found
+
+statement error
+SELECT redis_expireat('mykey', 1736918400, 'nonexistent_secret');
+----
+Redis secret not found
+
 # Test that we can create a redis secret
 statement ok
 CREATE SECRET my_test_secret (
