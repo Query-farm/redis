@@ -17,6 +17,7 @@ Currently supported Redis operations:
 - Hash operations: `HGET`, `HSET`, `HGETALL`, `HSCAN`, `HSCAN_OVER_SCAN`
 - List operations: `LPUSH`, `LRANGE`, `LRANGE_TABLE`
 - Key operations: `DEL`, `EXISTS`, `TYPE`, `SCAN`, `KEYS`
+- TTL operations: `EXPIRE`, `TTL`, `EXPIREAT`
 - Batch and discovery operations: `SCAN`, `HSCAN_OVER_SCAN`, `KEYS`
 
 ## Quick Reference: Available Functions
@@ -33,6 +34,9 @@ Currently supported Redis operations:
 | `redis_del(key, secret)` | Scalar | Delete a key (returns TRUE if deleted) |
 | `redis_exists(key, secret)` | Scalar | Check if a key exists (returns TRUE if exists) |
 | `redis_type(key, secret)` | Scalar | Get the type of a key |
+| `redis_expire(key, seconds, secret)` | Scalar | Set TTL in seconds (returns TRUE if set) |
+| `redis_ttl(key, secret)` | Scalar | Get remaining TTL (-2=key not exists, -1=no expiry) |
+| `redis_expireat(key, timestamp, secret)` | Scalar | Set expiry at Unix timestamp (returns TRUE if set) |
 | `redis_scan(cursor, pattern, count, secret)` | Scalar | Scan keys (returns cursor:keys_csv) |
 | `redis_hscan(key, cursor, pattern, count, secret)` | Scalar | Scan fields in a hash |
 | `redis_keys(pattern, secret)` | Table | List all keys matching a pattern |
@@ -155,6 +159,22 @@ SELECT redis_exists('user:1', 'redis');
 
 -- Get the type of a key
 SELECT redis_type('user:1', 'redis');
+```
+
+### TTL Operations
+```sql
+-- Set a key to expire in 1 hour
+SELECT redis_expire('session:123', 3600, 'redis');
+
+-- Check remaining TTL
+SELECT redis_ttl('session:123', 'redis') as remaining_seconds;
+
+-- Set expiry at specific timestamp
+SELECT redis_expireat('cache:item', 1736918400, 'redis');
+
+-- Expire all session keys in a query
+UPDATE sessions
+SET expired = CASE WHEN redis_expire('session:' || id, 300, 'redis') THEN TRUE ELSE FALSE END;
 ```
 
 ### Batch and Discovery Operations
