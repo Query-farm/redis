@@ -85,33 +85,33 @@ using redis_column_names_t = vector<string>;
 
 // A parsed RESP reply. RESP3 aggregate types (map, set, push) are flattened into arrays.
 struct RedisReply {
-	enum class Type { STRING, STATUS, ERROR, INTEGER, NIL, ARRAY };
+	enum class Type { RESP_STRING, RESP_STATUS, RESP_ERROR, RESP_INTEGER, RESP_NIL, RESP_ARRAY };
 
-	Type type = Type::NIL;
+	Type type = Type::RESP_NIL;
 	std::string str;
 	int64_t integer = 0;
 	std::vector<RedisReply> elements;
 
 	bool IsNil() const {
-		return type == Type::NIL;
+		return type == Type::RESP_NIL;
 	}
 	bool IsError() const {
-		return type == Type::ERROR;
+		return type == Type::RESP_ERROR;
 	}
 
 	static const char *TypeName(Type type) {
 		switch (type) {
-		case Type::STRING:
+		case Type::RESP_STRING:
 			return "bulk string";
-		case Type::STATUS:
+		case Type::RESP_STATUS:
 			return "simple string";
-		case Type::ERROR:
+		case Type::RESP_ERROR:
 			return "error";
-		case Type::INTEGER:
+		case Type::RESP_INTEGER:
 			return "integer";
-		case Type::NIL:
+		case Type::RESP_NIL:
 			return "nil";
-		case Type::ARRAY:
+		case Type::RESP_ARRAY:
 			return "array";
 		}
 		return "unknown";
@@ -120,10 +120,10 @@ struct RedisReply {
 	// The reply as text: bulk strings, simple strings and integers
 	std::string AsString() const {
 		switch (type) {
-		case Type::STRING:
-		case Type::STATUS:
+		case Type::RESP_STRING:
+		case Type::RESP_STATUS:
 			return str;
-		case Type::INTEGER:
+		case Type::RESP_INTEGER:
 			return std::to_string(integer);
 		default:
 			throw InvalidInputException("Unexpected Redis reply: expected a string, got %s", TypeName(type));
@@ -131,14 +131,14 @@ struct RedisReply {
 	}
 
 	int64_t AsInteger() const {
-		if (type != Type::INTEGER) {
+		if (type != Type::RESP_INTEGER) {
 			throw InvalidInputException("Unexpected Redis reply: expected an integer, got %s", TypeName(type));
 		}
 		return integer;
 	}
 
 	const std::vector<RedisReply> &AsArray() const {
-		if (type != Type::ARRAY) {
+		if (type != Type::RESP_ARRAY) {
 			throw InvalidInputException("Unexpected Redis reply: expected an array, got %s", TypeName(type));
 		}
 		return elements;
@@ -244,7 +244,7 @@ private:
 	}
 
 	bool ParseAggregate(size_t &pos, int64_t count, RedisReply &reply, int depth) {
-		reply.type = RedisReply::Type::ARRAY;
+		reply.type = RedisReply::Type::RESP_ARRAY;
 		reply.elements.clear();
 		reply.elements.reserve(static_cast<size_t>(std::min<int64_t>(count, 1024)));
 		for (int64_t i = 0; i < count; i++) {
@@ -273,27 +273,27 @@ private:
 		reply = RedisReply();
 		switch (type) {
 		case '+': // simple string
-			reply.type = RedisReply::Type::STATUS;
+			reply.type = RedisReply::Type::RESP_STATUS;
 			reply.str = rest;
 			return true;
 		case '-': // error
-			reply.type = RedisReply::Type::ERROR;
+			reply.type = RedisReply::Type::RESP_ERROR;
 			reply.str = rest;
 			return true;
 		case ':': // integer
-			reply.type = RedisReply::Type::INTEGER;
+			reply.type = RedisReply::Type::RESP_INTEGER;
 			reply.integer = ParseInteger(rest);
 			return true;
 		case '_': // RESP3 null
-			reply.type = RedisReply::Type::NIL;
+			reply.type = RedisReply::Type::RESP_NIL;
 			return true;
 		case '#': // RESP3 boolean
-			reply.type = RedisReply::Type::INTEGER;
+			reply.type = RedisReply::Type::RESP_INTEGER;
 			reply.integer = rest == "t" ? 1 : 0;
 			return true;
 		case ',': // RESP3 double
 		case '(': // RESP3 big number
-			reply.type = RedisReply::Type::STATUS;
+			reply.type = RedisReply::Type::RESP_STATUS;
 			reply.str = rest;
 			return true;
 		case '$':   // bulk string
@@ -301,16 +301,16 @@ private:
 		case '=': { // RESP3 verbatim string ("txt:" prefix)
 			auto length = ParseInteger(rest);
 			if (length < 0) {
-				reply.type = RedisReply::Type::NIL;
+				reply.type = RedisReply::Type::RESP_NIL;
 				return true;
 			}
 			if (!ReadBulk(pos, length, reply.str)) {
 				return false;
 			}
 			if (type == '!') {
-				reply.type = RedisReply::Type::ERROR;
+				reply.type = RedisReply::Type::RESP_ERROR;
 			} else {
-				reply.type = RedisReply::Type::STRING;
+				reply.type = RedisReply::Type::RESP_STRING;
 				if (type == '=' && reply.str.size() >= 4 && reply.str[3] == ':') {
 					reply.str = reply.str.substr(4);
 				}
@@ -322,7 +322,7 @@ private:
 		case '>': { // RESP3 push
 			auto count = ParseInteger(rest);
 			if (count < 0) {
-				reply.type = RedisReply::Type::NIL;
+				reply.type = RedisReply::Type::RESP_NIL;
 				return true;
 			}
 			return ParseAggregate(pos, count, reply, depth);
@@ -330,7 +330,7 @@ private:
 		case '%': { // RESP3 map, flattened to [key, value, key, value, ...]
 			auto count = ParseInteger(rest);
 			if (count < 0) {
-				reply.type = RedisReply::Type::NIL;
+				reply.type = RedisReply::Type::RESP_NIL;
 				return true;
 			}
 			return ParseAggregate(pos, count * 2, reply, depth);
@@ -1232,7 +1232,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"scan_pattern", "hscan_pattern", "count", "secret_name"},
 	    {"SELECT * FROM redis_hscan_over_scan('user:*', '*', 100, 'my_redis_secret');"});
 
-	QueryFarmSendTelemetry(loader, "redis", "2026102002");
+	QueryFarmSendTelemetry(loader, "redis", "2026102003");
 }
 
 void RedisExtension::Load(ExtensionLoader &loader) {
@@ -1244,7 +1244,7 @@ std::string RedisExtension::Name() {
 }
 
 std::string RedisExtension::Version() const {
-	return "2026102002";
+	return "2026102003";
 }
 
 } // namespace duckdb
