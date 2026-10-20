@@ -8,6 +8,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include <boost/asio.hpp>
 #include <string>
 #include <mutex>
@@ -295,7 +296,7 @@ static void RedisGetFunction(DataChunk &args, ExpressionState &state, Vector &re
 	auto &key_vector = args.data[0];
 	auto &secret_vector = args.data[1];
 
-	UnaryExecutor::Execute<string_t, string_t>(key_vector, result, args.size(), [&](string_t key) {
+	UnaryExecutor::Execute<string_t, string_t>(key_vector, result, [&](string_t key) {
 		try {
 			string host, port, password;
 			if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
@@ -317,7 +318,7 @@ static void RedisSetFunction(DataChunk &args, ExpressionState &state, Vector &re
 	auto &secret_vector = args.data[2];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    key_vector, value_vector, result, args.size(), [&](string_t key, string_t value) {
+	    key_vector, value_vector, result, [&](string_t key, string_t value) {
 		    try {
 			    string host, port, password;
 			    if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
@@ -340,7 +341,7 @@ static void RedisHGetFunction(DataChunk &args, ExpressionState &state, Vector &r
 	auto &secret_vector = args.data[2];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    key_vector, field_vector, result, args.size(), [&](string_t key, string_t field) {
+	    key_vector, field_vector, result, [&](string_t key, string_t field) {
 		    try {
 			    string host, port, password;
 			    if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
@@ -363,7 +364,7 @@ static void RedisHSetFunction(DataChunk &args, ExpressionState &state, Vector &r
 	auto &secret_vector = args.data[3];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    key_vector, field_vector, result, args.size(), [&](string_t key, string_t field) {
+	    key_vector, field_vector, result, [&](string_t key, string_t field) {
 		    try {
 			    string host, port, password;
 			    if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
@@ -387,7 +388,7 @@ static void RedisLPushFunction(DataChunk &args, ExpressionState &state, Vector &
 	auto &secret_vector = args.data[2];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    key_vector, value_vector, result, args.size(), [&](string_t key, string_t value) {
+	    key_vector, value_vector, result, [&](string_t key, string_t value) {
 		    try {
 			    string host, port, password;
 			    if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
@@ -410,7 +411,7 @@ static void RedisLRangeFunction(DataChunk &args, ExpressionState &state, Vector 
 	auto &secret_vector = args.data[3];
 
 	BinaryExecutor::Execute<string_t, int64_t, string_t>(
-	    key_vector, start_vector, result, args.size(), [&](string_t key, int64_t start) {
+	    key_vector, start_vector, result, [&](string_t key, int64_t start) {
 		    try {
 			    string host, port, password;
 			    if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
@@ -439,7 +440,7 @@ static void RedisMGetFunction(DataChunk &args, ExpressionState &state, Vector &r
 	auto &keys_list = args.data[0];
 	auto &secret_vector = args.data[1];
 
-	UnaryExecutor::Execute<string_t, string_t>(keys_list, result, args.size(), [&](string_t keys_str) {
+	UnaryExecutor::Execute<string_t, string_t>(keys_list, result, [&](string_t keys_str) {
 		try {
 			// Split comma-separated keys
 			std::vector<std::string> keys;
@@ -483,7 +484,7 @@ static void RedisScanFunction(DataChunk &args, ExpressionState &state, Vector &r
 	auto &secret_vector = args.data[3];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    cursor_vector, pattern_vector, result, args.size(), [&](string_t cursor, string_t pattern) {
+	    cursor_vector, pattern_vector, result, [&](string_t cursor, string_t pattern) {
 		    try {
 			    string host, port, password;
 			    if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
@@ -522,7 +523,7 @@ static void RedisHScanFunction(DataChunk &args, ExpressionState &state, Vector &
 	auto &secret_vector = args.data[4];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    key_vector, cursor_vector, result, args.size(), [&](string_t key, string_t cursor) {
+	    key_vector, cursor_vector, result, [&](string_t key, string_t cursor) {
 		    try {
 			    string host, port, password;
 			    if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
@@ -577,7 +578,7 @@ struct RedisHScanOverScanBindData : public duckdb::TableFunctionData {
 
 static duckdb::unique_ptr<duckdb::FunctionData>
 RedisHScanOverScanBind(duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
-                       duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<std::string> &names) {
+                       duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::Identifier> &names) {
 	auto result = duckdb::make_uniq<RedisHScanOverScanBindData>();
 	result->scan_pattern = input.inputs[0].ToString();
 	result->hscan_pattern = input.inputs[1].ToString();
@@ -598,14 +599,14 @@ static void RedisHScanOverScanFunction(duckdb::ClientContext &context, duckdb::T
                                        duckdb::DataChunk &output) {
 	auto &data = (RedisHScanOverScanBindData &)*data_p.bind_data;
 	idx_t out_row = 0;
-	const idx_t max_rows = output.size();
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;
 	while (out_row < max_rows) {
 		// If we have hscan_kvs buffered, emit them
 		while (data.hscan_kv_idx + 1 < data.hscan_kvs.size() && out_row < max_rows) {
 			// hscan_kvs = [field1, value1, field2, value2, ...]
-			output.SetValue(0, out_row, duckdb::Value(data.scan_keys[data.scan_key_idx]));
-			output.SetValue(1, out_row, duckdb::Value(data.hscan_kvs[data.hscan_kv_idx]));
-			output.SetValue(2, out_row, duckdb::Value(data.hscan_kvs[data.hscan_kv_idx + 1]));
+			output.data[0].SetValue(out_row, duckdb::Value(data.scan_keys[data.scan_key_idx]));
+			output.data[1].SetValue(out_row, duckdb::Value(data.hscan_kvs[data.hscan_kv_idx]));
+			output.data[2].SetValue(out_row, duckdb::Value(data.hscan_kvs[data.hscan_kv_idx + 1]));
 			data.hscan_kv_idx += 2;
 			out_row++;
 		}
@@ -654,7 +655,7 @@ static void RedisHScanOverScanFunction(duckdb::ClientContext &context, duckdb::T
 			break;
 		}
 	}
-	output.SetCardinality(out_row);
+	output.SetChildCardinality(out_row);
 }
 
 // Table function: redis_keys(pattern, secret_name) -> (key VARCHAR)
@@ -672,7 +673,7 @@ struct RedisKeysBindData : public duckdb::TableFunctionData {
 static duckdb::unique_ptr<duckdb::FunctionData> RedisKeysBind(duckdb::ClientContext &context,
                                                               duckdb::TableFunctionBindInput &input,
                                                               duckdb::vector<duckdb::LogicalType> &return_types,
-                                                              duckdb::vector<std::string> &names) {
+                                                              duckdb::vector<duckdb::Identifier> &names) {
 	auto result = duckdb::make_uniq<RedisKeysBindData>();
 	result->pattern = input.inputs[0].ToString();
 	result->secret_name = input.inputs[1].ToString();
@@ -689,10 +690,10 @@ static void RedisKeysFunction(duckdb::ClientContext &context, duckdb::TableFunct
                               duckdb::DataChunk &output) {
 	auto &data = (RedisKeysBindData &)*data_p.bind_data;
 	idx_t out_row = 0;
-	const idx_t max_rows = output.size();
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;
 	while (out_row < max_rows) {
 		while (data.key_idx < data.keys.size() && out_row < max_rows) {
-			output.SetValue(0, out_row, duckdb::Value(data.keys[data.key_idx]));
+			output.data[0].SetValue(out_row, duckdb::Value(data.keys[data.key_idx]));
 			data.key_idx++;
 			out_row++;
 		}
@@ -716,7 +717,7 @@ static void RedisKeysFunction(duckdb::ClientContext &context, duckdb::TableFunct
 			break;
 		}
 	}
-	output.SetCardinality(out_row);
+	output.SetChildCardinality(out_row);
 }
 
 // Table function: redis_hgetall(key, secret_name) -> (field VARCHAR, value VARCHAR)
@@ -733,7 +734,7 @@ struct RedisHGetAllBindData : public duckdb::TableFunctionData {
 static duckdb::unique_ptr<duckdb::FunctionData> RedisHGetAllBind(duckdb::ClientContext &context,
                                                                  duckdb::TableFunctionBindInput &input,
                                                                  duckdb::vector<duckdb::LogicalType> &return_types,
-                                                                 duckdb::vector<std::string> &names) {
+                                                                 duckdb::vector<duckdb::Identifier> &names) {
 	auto result = duckdb::make_uniq<RedisHGetAllBindData>();
 	result->key = input.inputs[0].ToString();
 	result->secret_name = input.inputs[1].ToString();
@@ -756,14 +757,14 @@ static void RedisHGetAllFunction(duckdb::ClientContext &context, duckdb::TableFu
 		data.fetched = true;
 	}
 	idx_t out_row = 0;
-	const idx_t max_rows = output.size();
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;
 	while (data.kv_idx + 1 < data.kvs.size() && out_row < max_rows) {
-		output.SetValue(0, out_row, duckdb::Value(data.kvs[data.kv_idx]));
-		output.SetValue(1, out_row, duckdb::Value(data.kvs[data.kv_idx + 1]));
+		output.data[0].SetValue(out_row, duckdb::Value(data.kvs[data.kv_idx]));
+		output.data[1].SetValue(out_row, duckdb::Value(data.kvs[data.kv_idx + 1]));
 		data.kv_idx += 2;
 		out_row++;
 	}
-	output.SetCardinality(out_row);
+	output.SetChildCardinality(out_row);
 }
 
 // Table function: redis_lrange_table(key, start, stop, secret_name) -> (index BIGINT, value VARCHAR)
@@ -782,7 +783,7 @@ struct RedisLRangeTableBindData : public duckdb::TableFunctionData {
 static duckdb::unique_ptr<duckdb::FunctionData> RedisLRangeTableBind(duckdb::ClientContext &context,
                                                                      duckdb::TableFunctionBindInput &input,
                                                                      duckdb::vector<duckdb::LogicalType> &return_types,
-                                                                     duckdb::vector<std::string> &names) {
+                                                                     duckdb::vector<duckdb::Identifier> &names) {
 	auto result = duckdb::make_uniq<RedisLRangeTableBindData>();
 	result->key = input.inputs[0].ToString();
 	result->start = input.inputs[1].GetValue<int64_t>();
@@ -807,19 +808,19 @@ static void RedisLRangeTableFunction(duckdb::ClientContext &context, duckdb::Tab
 		data.fetched = true;
 	}
 	idx_t out_row = 0;
-	const idx_t max_rows = output.size();
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;
 	for (; data.idx < data.values.size() && out_row < max_rows; data.idx++, out_row++) {
-		output.SetValue(0, out_row, duckdb::Value::BIGINT(data.idx));
-		output.SetValue(1, out_row, duckdb::Value(data.values[data.idx]));
+		output.data[0].SetValue(out_row, duckdb::Value::BIGINT(data.idx));
+		output.data[1].SetValue(out_row, duckdb::Value(data.values[data.idx]));
 	}
-	output.SetCardinality(out_row);
+	output.SetChildCardinality(out_row);
 }
 
 // Scalar function: redis_del(key, secret_name) -> BOOLEAN
 static void RedisDelFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &key_vector = args.data[0];
 	auto &secret_vector = args.data[1];
-	UnaryExecutor::Execute<string_t, bool>(key_vector, result, args.size(), [&](string_t key) {
+	UnaryExecutor::Execute<string_t, bool>(key_vector, result, [&](string_t key) {
 		string host, port, password;
 		if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
 			throw InvalidInputException("Redis secret not found");
@@ -837,7 +838,7 @@ static void RedisDelFunction(DataChunk &args, ExpressionState &state, Vector &re
 static void RedisExistsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &key_vector = args.data[0];
 	auto &secret_vector = args.data[1];
-	UnaryExecutor::Execute<string_t, bool>(key_vector, result, args.size(), [&](string_t key) {
+	UnaryExecutor::Execute<string_t, bool>(key_vector, result, [&](string_t key) {
 		string host, port, password;
 		if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
 			throw InvalidInputException("Redis secret not found");
@@ -855,7 +856,7 @@ static void RedisExistsFunction(DataChunk &args, ExpressionState &state, Vector 
 static void RedisTypeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &key_vector = args.data[0];
 	auto &secret_vector = args.data[1];
-	UnaryExecutor::Execute<string_t, string_t>(key_vector, result, args.size(), [&](string_t key) {
+	UnaryExecutor::Execute<string_t, string_t>(key_vector, result, [&](string_t key) {
 		string host, port, password;
 		if (!GetRedisSecret(state.GetContext(), secret_vector.GetValue(0).ToString(), host, port, password)) {
 			throw InvalidInputException("Redis secret not found");
@@ -887,7 +888,7 @@ static void RedisExpireFunction(DataChunk &args, ExpressionState &state, Vector 
 	auto conn = ConnectionPool::getInstance().getConnection(host, port, password);
 
 	BinaryExecutor::Execute<string_t, int64_t, bool>(
-	    key_vector, seconds_vector, result, args.size(), [&](string_t key, int64_t seconds) {
+	    key_vector, seconds_vector, result, [&](string_t key, int64_t seconds) {
 		    try {
 			    auto response = conn->execute(RedisProtocol::formatExpire(key.GetString(), seconds));
 			    auto result_int = RedisProtocol::parseIntegerResponse(response);
@@ -910,7 +911,7 @@ static void RedisTTLFunction(DataChunk &args, ExpressionState &state, Vector &re
 	}
 	auto conn = ConnectionPool::getInstance().getConnection(host, port, password);
 
-	UnaryExecutor::Execute<string_t, int64_t>(key_vector, result, args.size(), [&](string_t key) {
+	UnaryExecutor::Execute<string_t, int64_t>(key_vector, result, [&](string_t key) {
 		try {
 			auto response = conn->execute(RedisProtocol::formatTtl(key.GetString()));
 			// Returns: -2 if key doesn't exist, -1 if key has no expiry, or positive TTL in seconds
@@ -934,7 +935,7 @@ static void RedisExpireAtFunction(DataChunk &args, ExpressionState &state, Vecto
 	auto conn = ConnectionPool::getInstance().getConnection(host, port, password);
 
 	BinaryExecutor::Execute<string_t, int64_t, bool>(
-	    key_vector, timestamp_vector, result, args.size(), [&](string_t key, int64_t timestamp) {
+	    key_vector, timestamp_vector, result, [&](string_t key, int64_t timestamp) {
 		    try {
 			    auto response = conn->execute(RedisProtocol::formatExpireAt(key.GetString(), timestamp));
 			    auto result_int = RedisProtocol::parseIntegerResponse(response);
@@ -953,6 +954,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Helper to add description to a scalar function
 	auto add_scalar_function = [&](ScalarFunction func, const string &description, const vector<string> &param_names,
 	                               const vector<string> &examples, const string &category = "redis") {
+		// Every redis scalar function reports its errors by throwing
+		func.SetFallible();
 		CreateScalarFunctionInfo info(std::move(func));
 		FunctionDescription func_desc;
 		func_desc.description = description;
