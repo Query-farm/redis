@@ -1141,7 +1141,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"scan_pattern", "hscan_pattern", "count", "secret_name"},
 	    {"SELECT * FROM redis_hscan_over_scan('user:*', '*', 100, 'my_redis_secret');"});
 
-	QueryFarmSendTelemetry(loader, "redis", "2026100801");
+	QueryFarmSendTelemetry(loader, "redis", "2026102001");
 }
 
 void RedisExtension::Load(ExtensionLoader &loader) {
@@ -1153,7 +1153,7 @@ std::string RedisExtension::Name() {
 }
 
 std::string RedisExtension::Version() const {
-	return "2026100801";
+	return "2026102001";
 }
 
 } // namespace duckdb
