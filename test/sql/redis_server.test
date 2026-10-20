@@ -1,5 +1,5 @@
 # name: test/sql/redis_server.test
-# description: table functions against a live Redis server (set REDIS_TEST_PORT, and REDIS_TEST_PASSWORD, to run)
+# description: functions against a live Redis/Valkey server (set REDIS_TEST_PORT, and REDIS_TEST_PASSWORD, to run)
 # group: [redis]
 
 require redis
@@ -12,36 +12,254 @@ statement ok
 CREATE SECRET redis_test (TYPE redis, host '127.0.0.1', port '${REDIS_TEST_PORT}', password '${REDIS_TEST_PASSWORD}');
 
 statement ok
-SELECT redis_del('duckdb_test_list', 'redis_test'), redis_del('duckdb_test_hash', 'redis_test');
+CREATE SECRET redis_test2 (TYPE redis, host '127.0.0.1', port '${REDIS_TEST_PORT}', password '${REDIS_TEST_PASSWORD}');
 
+# start from a clean slate (also exercises redis_keys)
 statement ok
-SELECT redis_lpush('duckdb_test_list', 'a', 'redis_test');
+SELECT count(redis_del(key, 'redis_test')) FROM redis_keys('duckdb_test:*', 'redis_test');
 
-statement ok
-SELECT redis_lpush('duckdb_test_list', 'b', 'redis_test');
+query I
+SELECT count(*) FROM redis_keys('duckdb_test:*', 'redis_test');
+----
+0
 
-statement ok
-SELECT redis_lpush('duckdb_test_list', 'c', 'redis_test');
+# ---- strings: per-row values, NULL for missing keys ----
 
-# table functions used to fill at most output.size() rows per call, which is 0 on entry, so they returned nothing
+query I
+SELECT redis_set('duckdb_test:str:' || i, 'val' || i, 'redis_test') FROM range(3) t(i) ORDER BY i;
+----
+OK
+OK
+OK
+
 query II
-SELECT * FROM redis_lrange_table('duckdb_test_list', 0, -1, 'redis_test');
+SELECT i, redis_get('duckdb_test:str:' || i, 'redis_test') FROM range(4) t(i) ORDER BY i;
+----
+0	val0
+1	val1
+2	val2
+3	NULL
+
+# NULL arguments give NULL
+query II
+SELECT redis_get(NULL, 'redis_test'), redis_set('duckdb_test:str:0', NULL, 'redis_test');
+----
+NULL	NULL
+
+query I
+SELECT redis_get('duckdb_test:str:0', 'redis_test');
+----
+val0
+
+# missing keys keep their position in the MGET result
+query I
+SELECT redis_mget('duckdb_test:str:0,duckdb_test:missing,duckdb_test:str:2', 'redis_test');
+----
+val0,,val2
+
+# the secret is read per row too
+query II
+SELECT s, redis_get('duckdb_test:str:1', s) FROM (VALUES ('redis_test'), ('redis_test2')) t(s) ORDER BY s;
+----
+redis_test	val1
+redis_test2	val1
+
+# replies larger than one socket read
+query I
+SELECT redis_set('duckdb_test:large', repeat('x', 200000), 'redis_test');
+----
+OK
+
+query I
+SELECT length(redis_get('duckdb_test:large', 'redis_test'));
+----
+200000
+
+query III
+SELECT redis_exists('duckdb_test:str:0', 'redis_test'), redis_exists('duckdb_test:missing', 'redis_test'), redis_type('duckdb_test:str:0', 'redis_test');
+----
+true	false	string
+
+# ---- hashes: HSET takes the value of each row and returns the number of added fields ----
+
+query II
+SELECT i, redis_hset('duckdb_test:hash', 'f' || i, 'v' || i, 'redis_test') FROM range(3) t(i) ORDER BY i;
+----
+0	1
+1	1
+2	1
+
+query I
+SELECT redis_hset('duckdb_test:hash', 'f0', 'changed', 'redis_test');
+----
+0
+
+query I
+SELECT typeof(redis_hset('duckdb_test:hash', 'f0', 'changed', 'redis_test'));
+----
+BIGINT
+
+query II
+SELECT * FROM redis_hgetall('duckdb_test:hash', 'redis_test') ORDER BY field;
+----
+f0	changed
+f1	v1
+f2	v2
+
+query II
+SELECT redis_hget('duckdb_test:hash', 'f1', 'redis_test'), redis_hget('duckdb_test:hash', 'nope', 'redis_test');
+----
+v1	NULL
+
+query II
+SELECT starts_with(r, '0:'), array_to_string(list_sort(string_split(substr(r, 3), ',')), ' ') FROM (SELECT redis_hscan('duckdb_test:hash', '0', '*', 100, 'redis_test') AS r);
+----
+true	f0=changed f1=v1 f2=v2
+
+# ---- lists: LPUSH takes the value of each row and returns the list length ----
+
+query II
+SELECT v, redis_lpush('duckdb_test:list', v, 'redis_test') FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(n, v) ORDER BY n;
+----
+a	1
+b	2
+c	3
+
+query II
+SELECT * FROM redis_lrange_table('duckdb_test:list', 0, -1, 'redis_test');
 ----
 0	c
 1	b
 2	a
 
-statement ok
-SELECT redis_hset('duckdb_test_hash', 'f1', 'v1', 'redis_test');
+# stop is read per row
+query II
+SELECT i, redis_lrange('duckdb_test:list', 0, i, 'redis_test') FROM range(3) t(i) ORDER BY i;
+----
+0	c
+1	c,b
+2	c,b,a
 
+# table function state is per execution, not stored in the bind data
 statement ok
-SELECT redis_hset('duckdb_test_hash', 'f2', 'v2', 'redis_test');
+PREPARE lr AS SELECT count(*) FROM redis_lrange_table('duckdb_test:list', 0, -1, 'redis_test');
+
+query I
+EXECUTE lr;
+----
+3
+
+query I
+EXECUTE lr;
+----
+3
+
+# server error replies are reported, and the connection stays usable
+statement error
+SELECT redis_lpush('duckdb_test:hash', 'x', 'redis_test');
+----
+WRONGTYPE
+
+query I
+SELECT redis_lrange('duckdb_test:list', 0, -1, 'redis_test');
+----
+c,b,a
+
+# ---- SCAN based functions ----
+
+query I
+SELECT count(r) FROM (SELECT redis_set('duckdb_test:many:' || i, i::VARCHAR, 'redis_test') AS r FROM range(250) t(i));
+----
+250
 
 query II
-SELECT * FROM redis_hgetall('duckdb_test_hash', 'redis_test') ORDER BY field;
+SELECT count(*), count(DISTINCT key) FROM redis_keys('duckdb_test:many:*', 'redis_test');
 ----
-f1	v1
-f2	v2
+250	250
+
+query I
+SELECT key FROM redis_keys('duckdb_test:str:*', 'redis_test') ORDER BY key;
+----
+duckdb_test:str:0
+duckdb_test:str:1
+duckdb_test:str:2
+
+query II
+SELECT starts_with(r, '0:'), array_to_string(list_sort(string_split(substr(r, 3), ',')), ' ') FROM (SELECT redis_scan('0', 'duckdb_test:str:*', 1000, 'redis_test') AS r);
+----
+true	duckdb_test:str:0 duckdb_test:str:1 duckdb_test:str:2
+
+# follow the redis_scan cursor until it returns to 0
+query I
+WITH RECURSIVE scan(step, cursor, batch) AS (
+    SELECT 0, '0', ''
+    UNION ALL
+    SELECT step + 1, split_part(r, ':', 1), substr(r, strpos(r, ':') + 1)
+    FROM (SELECT step, redis_scan(cursor, 'duckdb_test:many:*', 10, 'redis_test') AS r FROM scan WHERE step = 0 OR cursor <> '0')
+)
+SELECT count(DISTINCT k) FROM scan, unnest(string_split(batch, ',')) AS u(k) WHERE k <> '';
+----
+250
+
+# redis_hscan_over_scan follows both cursors and skips keys that are not hashes
+statement ok
+SELECT redis_hset('duckdb_test:h:one', 'a', '1', 'redis_test'), redis_hset('duckdb_test:h:one', 'b', '2', 'redis_test'), redis_hset('duckdb_test:h:two', 'c', '3', 'redis_test'), redis_set('duckdb_test:h:str', 'not a hash', 'redis_test');
+
+query I
+SELECT sum(r) FROM (SELECT redis_hset('duckdb_test:h:big', 'f' || i, i::VARCHAR, 'redis_test') AS r FROM range(300) t(i));
+----
+300
+
+query III
+SELECT key, count(*), count(DISTINCT field) FROM redis_hscan_over_scan('duckdb_test:h:*', '*', 10, 'redis_test') GROUP BY key ORDER BY key;
+----
+duckdb_test:h:big	300	300
+duckdb_test:h:one	2	2
+duckdb_test:h:two	1	1
+
+query III
+SELECT * FROM redis_hscan_over_scan('duckdb_test:h:one', 'b', 10, 'redis_test');
+----
+duckdb_test:h:one	b	2
+
+# ---- expiry: per-row seconds ----
+
+query II
+SELECT i, redis_expire('duckdb_test:str:' || i, 100 * (i + 1), 'redis_test') FROM range(4) t(i) ORDER BY i;
+----
+0	true
+1	true
+2	true
+3	false
+
+query II
+SELECT i, redis_ttl('duckdb_test:str:' || i, 'redis_test') BETWEEN 100 * i + 90 AND 100 * (i + 1) FROM range(3) t(i) ORDER BY i;
+----
+0	true
+1	true
+2	true
+
+query II
+SELECT redis_ttl('duckdb_test:hash', 'redis_test'), redis_ttl('duckdb_test:missing', 'redis_test');
+----
+-1	-2
+
+query I
+SELECT redis_expireat('duckdb_test:hash', 4102444800, 'redis_test');
+----
+true
+
+# ---- cleanup ----
+
+query II
+SELECT redis_del('duckdb_test:list', 'redis_test'), redis_del('duckdb_test:missing', 'redis_test');
+----
+true	false
 
 statement ok
-SELECT redis_del('duckdb_test_list', 'redis_test'), redis_del('duckdb_test_hash', 'redis_test');
+SELECT count(redis_del(key, 'redis_test')) FROM redis_keys('duckdb_test:*', 'redis_test');
+
+query I
+SELECT count(*) FROM redis_keys('duckdb_test:*', 'redis_test');
+----
+0
