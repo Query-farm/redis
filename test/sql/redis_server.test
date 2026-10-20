@@ -1,0 +1,47 @@
+# name: test/sql/redis_server.test
+# description: table functions against a live Redis server (set REDIS_TEST_PORT, and REDIS_TEST_PASSWORD, to run)
+# group: [redis]
+
+require redis
+
+require-env REDIS_TEST_PORT
+
+require-env REDIS_TEST_PASSWORD
+
+statement ok
+CREATE SECRET redis_test (TYPE redis, host '127.0.0.1', port '${REDIS_TEST_PORT}', password '${REDIS_TEST_PASSWORD}');
+
+statement ok
+SELECT redis_del('duckdb_test_list', 'redis_test'), redis_del('duckdb_test_hash', 'redis_test');
+
+statement ok
+SELECT redis_lpush('duckdb_test_list', 'a', 'redis_test');
+
+statement ok
+SELECT redis_lpush('duckdb_test_list', 'b', 'redis_test');
+
+statement ok
+SELECT redis_lpush('duckdb_test_list', 'c', 'redis_test');
+
+# table functions used to fill at most output.size() rows per call, which is 0 on entry, so they returned nothing
+query II
+SELECT * FROM redis_lrange_table('duckdb_test_list', 0, -1, 'redis_test');
+----
+0	c
+1	b
+2	a
+
+statement ok
+SELECT redis_hset('duckdb_test_hash', 'f1', 'v1', 'redis_test');
+
+statement ok
+SELECT redis_hset('duckdb_test_hash', 'f2', 'v2', 'redis_test');
+
+query II
+SELECT * FROM redis_hgetall('duckdb_test_hash', 'redis_test') ORDER BY field;
+----
+f1	v1
+f2	v2
+
+statement ok
+SELECT redis_del('duckdb_test_list', 'redis_test'), redis_del('duckdb_test_hash', 'redis_test');
