@@ -598,7 +598,7 @@ static void RedisHScanOverScanFunction(duckdb::ClientContext &context, duckdb::T
                                        duckdb::DataChunk &output) {
 	auto &data = (RedisHScanOverScanBindData &)*data_p.bind_data;
 	idx_t out_row = 0;
-	const idx_t max_rows = output.size();
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;
 	while (out_row < max_rows) {
 		// If we have hscan_kvs buffered, emit them
 		while (data.hscan_kv_idx + 1 < data.hscan_kvs.size() && out_row < max_rows) {
@@ -689,7 +689,7 @@ static void RedisKeysFunction(duckdb::ClientContext &context, duckdb::TableFunct
                               duckdb::DataChunk &output) {
 	auto &data = (RedisKeysBindData &)*data_p.bind_data;
 	idx_t out_row = 0;
-	const idx_t max_rows = output.size();
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;
 	while (out_row < max_rows) {
 		while (data.key_idx < data.keys.size() && out_row < max_rows) {
 			output.SetValue(0, out_row, duckdb::Value(data.keys[data.key_idx]));
@@ -756,7 +756,7 @@ static void RedisHGetAllFunction(duckdb::ClientContext &context, duckdb::TableFu
 		data.fetched = true;
 	}
 	idx_t out_row = 0;
-	const idx_t max_rows = output.size();
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;
 	while (data.kv_idx + 1 < data.kvs.size() && out_row < max_rows) {
 		output.SetValue(0, out_row, duckdb::Value(data.kvs[data.kv_idx]));
 		output.SetValue(1, out_row, duckdb::Value(data.kvs[data.kv_idx + 1]));
@@ -807,7 +807,7 @@ static void RedisLRangeTableFunction(duckdb::ClientContext &context, duckdb::Tab
 		data.fetched = true;
 	}
 	idx_t out_row = 0;
-	const idx_t max_rows = output.size();
+	const idx_t max_rows = STANDARD_VECTOR_SIZE;
 	for (; data.idx < data.values.size() && out_row < max_rows; data.idx++, out_row++) {
 		output.SetValue(0, out_row, duckdb::Value::BIGINT(data.idx));
 		output.SetValue(1, out_row, duckdb::Value(data.values[data.idx]));
