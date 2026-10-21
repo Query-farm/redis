@@ -1,36 +1,18 @@
 cmake_minimum_required(VERSION 3.5)
 
-# Set extension name here
 set(TARGET_NAME redis)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED 1)
-
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
+include_directories(src/include)
 
-# Find Boost headers from vcpkg
-find_package(Boost REQUIRED)
-include_directories(
-    src/include
-    ${Boost_INCLUDE_DIRS}
-)
-
-# Add redis_secret.cpp to the sources
-set(EXTENSION_SOURCES
-    src/redis_extension.cpp
-    src/redis_secret.cpp
-    src/query_farm_telemetry.cpp
-)
+set(EXTENSION_SOURCES src/redis_extension.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
-
-# Add Boost include directories to targets
-target_include_directories(${EXTENSION_NAME} PRIVATE ${Boost_INCLUDE_DIRS})
-target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${Boost_INCLUDE_DIRS})
 
 install(
   TARGETS ${EXTENSION_NAME}
