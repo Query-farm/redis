@@ -1036,6 +1036,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register the secret functions first!
 	CreateRedisSecretFunctions::Register(loader);
 
+	// DuckDB 2.0 names a parameter registered with a bare type "col<N>" in duckdb_functions(). Give each one its
+	// documented name instead; the parameters stay positional-only, so calls work exactly as before.
+	auto name_parameters = [](FunctionSignature &signature, const vector<string> &param_names) {
+		if (signature.GetParameterCount() != param_names.size()) {
+			throw InternalException("redis: %llu parameter names given for %llu parameters", param_names.size(),
+			                        signature.GetParameterCount());
+		}
+		for (idx_t i = 0; i < param_names.size(); i++) {
+			signature.GetParameter(i).SetName(Identifier(param_names[i]));
+		}
+	};
+
 	// Helper to add description to a scalar function
 	auto add_scalar_function = [&](ScalarFunction func, const string &description, const vector<string> &param_names,
 	                               const vector<string> &examples, const string &category = "redis") {
@@ -1044,6 +1056,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		// They talk to an external server (and most change it), so they must run for every row and never be
 		// constant-folded or deduplicated
 		func.SetVolatile();
+		name_parameters(func.GetSignature(), param_names);
 		CreateScalarFunctionInfo info(std::move(func));
 		FunctionDescription func_desc;
 		func_desc.description = description;
@@ -1057,6 +1070,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Helper to add description to a table function
 	auto add_table_function = [&](TableFunction func, const string &description, const vector<string> &param_names,
 	                              const vector<string> &examples, const string &category = "redis") {
+		name_parameters(func.GetSignature(), param_names);
 		CreateTableFunctionInfo info(std::move(func));
 		FunctionDescription func_desc;
 		func_desc.description = description;
@@ -1230,7 +1244,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"scan_pattern", "hscan_pattern", "count", "secret_name"},
 	    {"SELECT * FROM redis_hscan_over_scan('user:*', '*', 100, 'my_redis_secret');"});
 
-	QueryFarmSendTelemetry(loader, "redis", "2026102003");
+	QueryFarmSendTelemetry(loader, "redis", "2026102101");
 }
 
 void RedisExtension::Load(ExtensionLoader &loader) {
@@ -1242,7 +1256,7 @@ std::string RedisExtension::Name() {
 }
 
 std::string RedisExtension::Version() const {
-	return "2026102003";
+	return "2026102101";
 }
 
 } // namespace duckdb
