@@ -442,44 +442,46 @@ private:
 	std::unordered_map<std::string, std::shared_ptr<RedisConnection>> connections_;
 };
 
-static bool GetRedisSecret(ClientContext &context, const string &secret_name, string &host, string &port,
+// Looks up a redis secret by name and reads its connection settings. Throws if the secret doesn't exist or lacks
+// host/port. The password is optional; without one the connection is made without AUTH.
+static void GetRedisSecret(ClientContext &context, const string &secret_name, string &host, string &port,
                            string &password) {
 	auto &secret_manager = SecretManager::Get(context);
-	try {
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-		auto secret_match = secret_manager.LookupSecret(transaction, secret_name, "redis");
-		if (secret_match.HasMatch()) {
-			auto &secret = secret_match.GetSecret();
-			if (secret.GetType() != "redis") {
-				throw InvalidInputException("Invalid secret type. Expected 'redis', got '%s'", secret.GetType());
-			}
-			const auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&secret);
-			if (!kv_secret) {
-				throw InvalidInputException("Invalid secret format for 'redis' secret");
-			}
-
-			Value host_val, port_val, password_val;
-			if (!kv_secret->TryGetValue("host", host_val) || !kv_secret->TryGetValue("port", port_val) ||
-			    !kv_secret->TryGetValue("password", password_val)) {
-				return false;
-			}
-
-			host = host_val.ToString();
-			port = port_val.ToString();
-			password = password_val.ToString();
-			return true;
-		}
-	} catch (...) {
-		return false;
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	// Look the secret up by name. LookupSecret() matches by scope, so an unscoped redis secret would be returned
+	// for any name.
+	auto secret_entry = secret_manager.GetSecretByName(transaction, secret_name);
+	if (!secret_entry || !secret_entry->secret) {
+		throw InvalidInputException("Redis secret not found");
 	}
-	return false;
+	auto &secret = *secret_entry->secret;
+	if (secret.GetType() != "redis") {
+		throw InvalidInputException("Invalid secret type. Expected 'redis', got '%s'", secret.GetType());
+	}
+	const auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&secret);
+	if (!kv_secret) {
+		throw InvalidInputException("Invalid secret format for 'redis' secret");
+	}
+
+	Value host_val, port_val, password_val;
+	if (!kv_secret->TryGetValue("host", host_val) || host_val.IsNull()) {
+		throw InvalidInputException("Redis secret '%s' is missing required key 'host'", secret_name);
+	}
+	if (!kv_secret->TryGetValue("port", port_val) || port_val.IsNull()) {
+		throw InvalidInputException("Redis secret '%s' is missing required key 'port'", secret_name);
+	}
+	host = host_val.ToString();
+	port = port_val.ToString();
+	if (kv_secret->TryGetValue("password", password_val) && !password_val.IsNull()) {
+		password = password_val.ToString();
+	} else {
+		password.clear();
+	}
 }
 
 static std::shared_ptr<RedisConnection> GetRedisConnection(ClientContext &context, const string &secret_name) {
 	string host, port, password;
-	if (!GetRedisSecret(context, secret_name, host, port, password)) {
-		throw InvalidInputException("Redis secret not found");
-	}
+	GetRedisSecret(context, secret_name, host, port, password);
 	return ConnectionPool::getInstance().getConnection(host, port, password);
 }
 
@@ -771,9 +773,7 @@ struct RedisTableBindData : public TableFunctionData {
 	std::string host, port, password;
 
 	void LookupSecret(ClientContext &context, const std::string &secret_name) {
-		if (!GetRedisSecret(context, secret_name, host, port, password)) {
-			throw InvalidInputException("Redis secret not found");
-		}
+		GetRedisSecret(context, secret_name, host, port, password);
 	}
 	std::shared_ptr<RedisConnection> Connect() const {
 		return ConnectionPool::getInstance().getConnection(host, port, password);
@@ -1244,7 +1244,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"scan_pattern", "hscan_pattern", "count", "secret_name"},
 	    {"SELECT * FROM redis_hscan_over_scan('user:*', '*', 100, 'my_redis_secret');"});
 
-	QueryFarmSendTelemetry(loader, "redis", "2026102101");
+	QueryFarmSendTelemetry(loader, "redis", "2026102102");
 }
 
 void RedisExtension::Load(ExtensionLoader &loader) {
@@ -1256,7 +1256,7 @@ std::string RedisExtension::Name() {
 }
 
 std::string RedisExtension::Version() const {
-	return "2026102101";
+	return "2026102102";
 }
 
 } // namespace duckdb
