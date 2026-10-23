@@ -7,28 +7,17 @@
   </a>
 </p>
 
-# DuckDB Redis Client Extension
+# Redis Extension for DuckDB
 
-[![DuckDB](https://img.shields.io/badge/DuckDB-community_extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://duckdb.org/community_extensions/extensions/redis.html)
-[![v1.5 build](https://github.com/Query-farm/redis/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=v1.5)](https://github.com/Query-farm/redis/actions/workflows/MainDistributionPipeline.yml?query=branch%3Av1.5)
+[![DuckDB](https://img.shields.io/badge/DuckDB-extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://query.farm/products/extensions/redis/)
+[![v2.0 build](https://github.com/Query-farm/redis/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=v2.0)](https://github.com/Query-farm/redis/actions/workflows/MainDistributionPipeline.yml?query=branch%3Av2.0)
 
-This extension provides Redis client functionality for DuckDB, allowing you to interact with a Redis server directly from SQL queries.
-
-> Experimental: USE AT YOUR OWN RISK!
+Read and write Redis data directly from DuckDB SQL. Experimental.
 
 ## Documentation
 
 Full documentation, including installation, usage, the function reference, and cookbook examples, is available at:
 
-**[https://query.farm/products/extensions/redis](https://query.farm/products/extensions/redis)**
+**[https://query.farm/products/extensions/redis/](https://query.farm/products/extensions/redis/)**
 
-## Installation
-
-```sql
-INSTALL redis FROM community;
-LOAD redis;
-```
-
-## Development
-
-For instructions on building the extension from source and running its tests, see [BUILDING.md](BUILDING.md).
+[Build and test](BUILDING.md)
