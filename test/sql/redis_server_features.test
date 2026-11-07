@@ -1,0 +1,265 @@
+# name: test/sql/redis_server_features.test
+# description: typed results, pipelining, connection isolation, db index, ACL user (needs REDIS_TEST_PORT and REDIS_TEST_PASSWORD)
+# group: [redis]
+
+require redis
+
+require-env REDIS_TEST_PORT
+
+require-env REDIS_TEST_PASSWORD
+
+statement ok
+CREATE SECRET rt (TYPE redis, host '127.0.0.1', port '{REDIS_TEST_PORT}', password '{REDIS_TEST_PASSWORD}');
+
+statement ok
+SELECT count(redis_del(key, 'rt')) FROM redis_keys('duckdb_feat:*', 'rt');
+
+# ---- connections are not shared between secrets with different credentials ----
+
+statement ok
+SELECT redis_set('duckdb_feat:s', 'v', 'rt');
+
+statement ok
+CREATE SECRET rt_wrong (TYPE redis, host '127.0.0.1', port '{REDIS_TEST_PORT}', password 'not-the-password');
+
+statement error
+SELECT redis_get('duckdb_feat:s', 'rt_wrong');
+----
+Redis connection error
+
+statement ok
+CREATE SECRET rt_nopass (TYPE redis, host '127.0.0.1', port '{REDIS_TEST_PORT}');
+
+statement error
+SELECT redis_get('duckdb_feat:s', 'rt_nopass');
+----
+NOAUTH
+
+query I
+SELECT redis_get('duckdb_feat:s', 'rt');
+----
+v
+
+# ---- db index: keys in db 1 are not visible from db 0 ----
+
+statement ok
+CREATE SECRET rt_db1 (TYPE redis, host '127.0.0.1', port '{REDIS_TEST_PORT}', password '{REDIS_TEST_PASSWORD}', db 1);
+
+query I
+SELECT redis_set('duckdb_feat:db', 'one', 'rt_db1');
+----
+OK
+
+query II
+SELECT redis_get('duckdb_feat:db', 'rt_db1'), redis_get('duckdb_feat:db', 'rt');
+----
+one	NULL
+
+query I
+SELECT redis_del('duckdb_feat:db', 'rt_db1');
+----
+true
+
+# ---- ACL user (Redis 6+) ----
+
+statement ok
+SELECT redis_command(['ACL', 'SETUSER', 'duckdb_feat_user', 'reset', 'on', '>feat-pass', '~duckdb_feat:*', '+@all'], 'rt');
+
+statement ok
+CREATE SECRET rt_user (TYPE redis, host '127.0.0.1', port '{REDIS_TEST_PORT}', username 'duckdb_feat_user', password 'feat-pass');
+
+query I
+SELECT redis_get('duckdb_feat:s', 'rt_user');
+----
+v
+
+# the ACL limits this user to duckdb_feat:* keys
+statement error
+SELECT redis_get('other:key', 'rt_user');
+----
+NOPERM
+
+statement ok
+CREATE SECRET rt_user_wrong (TYPE redis, host '127.0.0.1', port '{REDIS_TEST_PORT}', username 'duckdb_feat_user', password 'nope');
+
+statement error
+SELECT redis_get('duckdb_feat:s', 'rt_user_wrong');
+----
+WRONGPASS
+
+statement ok
+SELECT redis_command(['ACL', 'DELUSER', 'duckdb_feat_user'], 'rt');
+
+# ---- lists: typed results and real indexes ----
+
+statement ok
+SELECT redis_lpush('duckdb_feat:list', v, 'rt') FROM (VALUES ('a,1'), ('b'), ('c')) t(v);
+
+query I
+SELECT redis_lrange_list('duckdb_feat:list', 0, -1, 'rt');
+----
+[c, b, 'a,1']
+
+query I
+SELECT redis_lrange_list('duckdb_feat:missing', 0, -1, 'rt');
+----
+[]
+
+query II
+SELECT * FROM redis_lrange_table('duckdb_feat:list', 1, -1, 'rt');
+----
+1	b
+2	a,1
+
+query II
+SELECT * FROM redis_lrange_table('duckdb_feat:list', -2, -1, 'rt');
+----
+1	b
+2	a,1
+
+query II
+SELECT * FROM redis_lrange_table('duckdb_feat:list', -10, 0, 'rt');
+----
+0	c
+
+# ---- MGET as a list: commas and missing keys are unambiguous ----
+
+statement ok
+SELECT redis_set('duckdb_feat:m1', 'x,y', 'rt'), redis_set('duckdb_feat:m2', '', 'rt');
+
+query I
+SELECT redis_mget_list(['duckdb_feat:m1', 'duckdb_feat:missing', 'duckdb_feat:m2'], 'rt');
+----
+['x,y', NULL, '']
+
+# per-row lists
+query II
+SELECT i, redis_mget_list(CASE WHEN i = 0 THEN ['duckdb_feat:m1'] ELSE ['duckdb_feat:m2', 'duckdb_feat:m1'] END, 'rt') FROM range(2) t(i) ORDER BY i;
+----
+0	['x,y']
+1	['', 'x,y']
+
+# ---- SCAN / HSCAN pages ----
+
+statement ok
+SELECT redis_hset('duckdb_feat:h', 'f' || i, 'v,' || i, 'rt') FROM range(3) t(i);
+
+query II
+SELECT p.cursor, list_sort(p.keys) FROM (SELECT redis_scan_page('0', 'duckdb_feat:m*', 1000, 'rt') AS p);
+----
+0	['duckdb_feat:m1', 'duckdb_feat:m2']
+
+query II
+SELECT p.cursor, p.entries['f1'] FROM (SELECT redis_hscan_page('duckdb_feat:h', '0', '*', 100, 'rt') AS p);
+----
+0	v,1
+
+query I
+SELECT cardinality(redis_hgetall_map('duckdb_feat:h', 'rt'));
+----
+3
+
+query I
+SELECT redis_hgetall_map('duckdb_feat:h', 'rt')['f2'];
+----
+v,2
+
+query I
+SELECT redis_hgetall_map('duckdb_feat:missing', 'rt');
+----
+{}
+
+# ---- redis_command ----
+
+query I
+SELECT redis_command(['PING'], 'rt');
+----
+PONG
+
+query I
+SELECT redis_command(['INCRBY', 'duckdb_feat:counter', '5'], 'rt')::BIGINT;
+----
+5
+
+query I
+SELECT redis_command(['GET', 'duckdb_feat:missing'], 'rt');
+----
+NULL
+
+statement ok
+SELECT redis_command(['SADD', 'duckdb_feat:set', 'a"b', 'c'], 'rt');
+
+query I
+SELECT redis_command(['SMEMBERS', 'duckdb_feat:set'], 'rt') IN ('["a\"b","c"]', '["c","a\"b"]');
+----
+true
+
+query I
+SELECT redis_command(['LRANGE', 'duckdb_feat:list', '0', '0'], 'rt');
+----
+["c"]
+
+statement error
+SELECT redis_command(['NOSUCHCOMMAND'], 'rt');
+----
+unknown command
+
+# SELECT through redis_command does not leak into pooled connections
+statement ok
+SELECT redis_command(['SELECT', '1'], 'rt');
+
+query I
+SELECT redis_get('duckdb_feat:s', 'rt');
+----
+v
+
+# ---- pipelining: many rows in one chunk, results stay in row order ----
+
+query II
+SELECT count(*), sum((r = 'OK')::INT) FROM (SELECT redis_set('duckdb_feat:p:' || i, i::VARCHAR, 'rt') AS r FROM range(5000) t(i));
+----
+5000	5000
+
+query I
+SELECT count(*) FROM (SELECT i, redis_get('duckdb_feat:p:' || i, 'rt') AS v FROM range(5000) t(i)) WHERE v::BIGINT <> i;
+----
+0
+
+# an error reply in the middle of a chunk is reported
+statement error
+SELECT redis_lpush(CASE WHEN i = 7 THEN 'duckdb_feat:h' ELSE 'duckdb_feat:l2' END, 'x', 'rt') FROM range(20) t(i);
+----
+WRONGTYPE
+
+# ---- reply timeout: BLPOP blocks on the server longer than the timeout ----
+
+statement ok
+CREATE SECRET rt_fast (TYPE redis, host '127.0.0.1', port '{REDIS_TEST_PORT}', password '{REDIS_TEST_PASSWORD}', timeout_ms 300);
+
+statement error
+SELECT redis_command(['BLPOP', 'duckdb_feat:never', '5'], 'rt_fast');
+----
+timed out waiting for a reply after 300 ms
+
+# the session setting applies when the secret has no timeout_ms
+statement ok
+SET redis_timeout_ms = 300;
+
+statement error
+SELECT redis_command(['BLPOP', 'duckdb_feat:never', '5'], 'rt');
+----
+timed out waiting for a reply after 300 ms
+
+statement ok
+RESET redis_timeout_ms;
+
+# the connection pool recovers afterwards
+query I
+SELECT redis_get('duckdb_feat:s', 'rt');
+----
+v
+
+# ---- cleanup ----
+
+statement ok
+SELECT count(redis_del(key, 'rt')) FROM redis_keys('duckdb_feat:*', 'rt');

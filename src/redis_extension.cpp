@@ -9,10 +9,22 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/common/vector/unified_vector_format.hpp"
 #include <boost/asio.hpp>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <stdexcept>
 #include <cerrno>
 #include <cstdlib>
 #include <string>
@@ -25,6 +37,9 @@
 namespace duckdb {
 
 using boost::asio::ip::tcp;
+
+// Extension version, also reported by telemetry
+static constexpr const char *REDIS_EXTENSION_VERSION = "2026110701";
 
 //===--------------------------------------------------------------------===//
 // DuckDB API shims (the only code that differs between the v1.5 and v2.0 branches)
@@ -160,19 +175,21 @@ struct RedisReply {
 class RedisProtocol {
 public:
 	// Encode a command as a RESP array of bulk strings
-	static std::string formatCommand(const std::vector<std::string> &args) {
-		std::string cmd = "*" + std::to_string(args.size()) + "\r\n";
+	static void AppendCommand(std::string &out, const std::vector<std::string> &args) {
+		out += "*" + std::to_string(args.size()) + "\r\n";
 		for (auto &arg : args) {
-			cmd += "$" + std::to_string(arg.size()) + "\r\n";
-			cmd += arg;
-			cmd += "\r\n";
+			out += "$" + std::to_string(arg.size()) + "\r\n";
+			out += arg;
+			out += "\r\n";
 		}
-		return cmd;
 	}
 };
 
 // Incremental RESP parser. Bytes are appended with Feed(); TryParse() returns true once a complete reply is
 // buffered. Handles nested arrays, null bulk strings/arrays and the RESP3 types.
+//
+// Completeness is tracked by a resumable scanner that looks at every byte once, so a large reply arriving in many
+// reads costs linear time; the reply is materialised only once it is complete.
 class RedisReplyParser {
 public:
 	void Feed(const char *data, size_t len) {
@@ -180,13 +197,19 @@ public:
 	}
 
 	bool TryParse(RedisReply &reply) {
+		if (!ScanComplete()) {
+			return false;
+		}
 		size_t pos = pos_;
 		if (!ParseValue(pos, reply, 0)) {
-			return false;
+			throw InternalException("Redis protocol error: scanner and parser disagree");
 		}
 		pos_ = pos;
 		if (pos_ == buffer_.size()) {
 			buffer_.clear();
+			pos_ = 0;
+		} else if (pos_ > COMPACT_THRESHOLD) {
+			buffer_.erase(0, pos_);
 			pos_ = 0;
 		}
 		return true;
@@ -195,26 +218,44 @@ public:
 	void Reset() {
 		buffer_.clear();
 		pos_ = 0;
+		scan_stack_.clear();
+		scan_pos_ = 0;
+	}
+
+	// Bytes buffered but not yet returned as a reply
+	bool HasPendingData() const {
+		return pos_ < buffer_.size();
 	}
 
 private:
 	static constexpr int MAX_DEPTH = 128;
 	static constexpr int64_t MAX_BULK_LENGTH = 512LL * 1024 * 1024;
+	// Upper bound on the element count of an aggregate. Each element takes at least 3 bytes, so a larger count
+	// can't be backed by real data; bounding it also keeps `count * 2` for maps from overflowing.
+	static constexpr int64_t MAX_AGGREGATE_COUNT = 1LL << 30;
+	// Simple strings, errors and headers are short; a longer line without CRLF is a protocol error
+	static constexpr size_t MAX_LINE_LENGTH = 64ULL * 1024 * 1024;
+	static constexpr size_t COMPACT_THRESHOLD = 1ULL << 20;
 
-	bool ReadLine(size_t &pos, std::string &line) {
-		auto end = buffer_.find("\r\n", pos);
+	enum class Kind { SCALAR, BULK, AGGREGATE, ATTRIBUTE };
+
+	// Finds the end of the line starting at pos. Returns false when the CRLF hasn't arrived yet.
+	bool FindLine(size_t pos, size_t &end) const {
+		end = buffer_.find("\r\n", pos);
 		if (end == std::string::npos) {
+			if (buffer_.size() - pos > MAX_LINE_LENGTH) {
+				throw InvalidInputException("Redis protocol error: reply line too long");
+			}
 			return false;
 		}
-		line = buffer_.substr(pos, end - pos);
-		pos = end + 2;
 		return true;
 	}
 
-	static int64_t ParseInteger(const std::string &text) {
-		if (text.empty()) {
+	static int64_t ParseInteger(const char *data, size_t len) {
+		if (len == 0) {
 			throw InvalidInputException("Redis protocol error: empty integer");
 		}
+		std::string text(data, len);
 		errno = 0;
 		char *end = nullptr;
 		auto value = std::strtoll(text.c_str(), &end, 10);
@@ -224,12 +265,123 @@ private:
 		return value;
 	}
 
-	// Bulk payload of `length` bytes followed by CRLF
-	bool ReadBulk(size_t &pos, int64_t length, std::string &out) {
+	static int64_t CheckedCount(int64_t count) {
+		if (count > MAX_AGGREGATE_COUNT) {
+			throw InvalidInputException("Redis protocol error: aggregate too large (%lld elements)", (long long)count);
+		}
+		return count;
+	}
+
+	static int64_t CheckedBulkLength(int64_t length) {
 		if (length > MAX_BULK_LENGTH) {
 			throw InvalidInputException("Redis protocol error: bulk string too large (%lld bytes)", (long long)length);
 		}
-		auto len = static_cast<size_t>(length);
+		return length;
+	}
+
+	// Classifies a reply header line. For bulk strings `n` is the length, for aggregates the number of child
+	// values (map entries count twice); negative means nil.
+	static Kind Classify(char type, const char *rest, size_t rest_len, int64_t &n) {
+		n = 0;
+		switch (type) {
+		case '+':
+		case '-':
+		case ':':
+		case '_':
+		case '#':
+		case ',':
+		case '(':
+			if (type == ':') {
+				ParseInteger(rest, rest_len);
+			}
+			return Kind::SCALAR;
+		case '$':
+		case '!':
+		case '=':
+			n = ParseInteger(rest, rest_len);
+			if (n >= 0) {
+				CheckedBulkLength(n);
+			}
+			return Kind::BULK;
+		case '*':
+		case '~':
+		case '>':
+			n = CheckedCount(ParseInteger(rest, rest_len));
+			return Kind::AGGREGATE;
+		case '%':
+			n = CheckedCount(ParseInteger(rest, rest_len));
+			if (n > 0) {
+				n *= 2;
+			}
+			return Kind::AGGREGATE;
+		case '|':
+			n = CheckedCount(ParseInteger(rest, rest_len));
+			n = n > 0 ? n * 2 : 0;
+			return Kind::ATTRIBUTE;
+		default:
+			throw InvalidInputException("Redis protocol error: unknown reply type '%c'", type);
+		}
+	}
+
+	// Advances the completeness scan as far as the buffered bytes allow. Returns true once one complete reply
+	// starting at pos_ is buffered.
+	bool ScanComplete() {
+		if (scan_stack_.empty()) {
+			scan_pos_ = pos_;
+			scan_stack_.push_back(1);
+		}
+		while (!scan_stack_.empty()) {
+			if (scan_stack_.size() > MAX_DEPTH + 1) {
+				throw InvalidInputException("Redis protocol error: reply nested too deeply");
+			}
+			size_t end;
+			if (!FindLine(scan_pos_, end)) {
+				return false;
+			}
+			if (end == scan_pos_) {
+				throw InvalidInputException("Redis protocol error: empty reply line");
+			}
+			int64_t n;
+			auto kind = Classify(buffer_[scan_pos_], buffer_.data() + scan_pos_ + 1, end - scan_pos_ - 1, n);
+			size_t next = end + 2;
+			if (kind == Kind::BULK && n >= 0) {
+				auto len = static_cast<size_t>(n);
+				if (buffer_.size() - next < len + 2) {
+					return false;
+				}
+				if (buffer_[next + len] != '\r' || buffer_[next + len + 1] != '\n') {
+					throw InvalidInputException("Redis protocol error: bulk string not terminated by CRLF");
+				}
+				next += len + 2;
+			}
+			scan_pos_ = next;
+			// An attribute precedes the value it annotates, so it doesn't use up an element of its parent
+			if (kind != Kind::ATTRIBUTE) {
+				scan_stack_.back()--;
+			}
+			if ((kind == Kind::AGGREGATE || kind == Kind::ATTRIBUTE) && n > 0) {
+				scan_stack_.push_back(n);
+			}
+			while (!scan_stack_.empty() && scan_stack_.back() == 0) {
+				scan_stack_.pop_back();
+			}
+		}
+		return true;
+	}
+
+	bool ReadLine(size_t &pos, std::string &line) {
+		size_t end;
+		if (!FindLine(pos, end)) {
+			return false;
+		}
+		line = buffer_.substr(pos, end - pos);
+		pos = end + 2;
+		return true;
+	}
+
+	// Bulk payload of `length` bytes followed by CRLF
+	bool ReadBulk(size_t &pos, int64_t length, std::string &out) {
+		auto len = static_cast<size_t>(CheckedBulkLength(length));
 		if (buffer_.size() - pos < len + 2) {
 			return false;
 		}
@@ -268,41 +420,41 @@ private:
 		}
 		auto type = line[0];
 		auto rest = line.substr(1);
+		int64_t n;
+		auto kind = Classify(type, rest.data(), rest.size(), n);
 		reply = RedisReply();
-		switch (type) {
-		case '+': // simple string
-			reply.type = RedisReply::Type::RESP_STATUS;
-			reply.str = rest;
+		switch (kind) {
+		case Kind::SCALAR:
+			switch (type) {
+			case '+': // simple string
+			case ',': // RESP3 double
+			case '(': // RESP3 big number
+				reply.type = RedisReply::Type::RESP_STATUS;
+				reply.str = rest;
+				break;
+			case '-': // error
+				reply.type = RedisReply::Type::RESP_ERROR;
+				reply.str = rest;
+				break;
+			case ':': // integer
+				reply.type = RedisReply::Type::RESP_INTEGER;
+				reply.integer = ParseInteger(rest.data(), rest.size());
+				break;
+			case '#': // RESP3 boolean
+				reply.type = RedisReply::Type::RESP_INTEGER;
+				reply.integer = rest == "t" ? 1 : 0;
+				break;
+			default: // '_' RESP3 null
+				reply.type = RedisReply::Type::RESP_NIL;
+				break;
+			}
 			return true;
-		case '-': // error
-			reply.type = RedisReply::Type::RESP_ERROR;
-			reply.str = rest;
-			return true;
-		case ':': // integer
-			reply.type = RedisReply::Type::RESP_INTEGER;
-			reply.integer = ParseInteger(rest);
-			return true;
-		case '_': // RESP3 null
-			reply.type = RedisReply::Type::RESP_NIL;
-			return true;
-		case '#': // RESP3 boolean
-			reply.type = RedisReply::Type::RESP_INTEGER;
-			reply.integer = rest == "t" ? 1 : 0;
-			return true;
-		case ',': // RESP3 double
-		case '(': // RESP3 big number
-			reply.type = RedisReply::Type::RESP_STATUS;
-			reply.str = rest;
-			return true;
-		case '$':   // bulk string
-		case '!':   // RESP3 bulk error
-		case '=': { // RESP3 verbatim string ("txt:" prefix)
-			auto length = ParseInteger(rest);
-			if (length < 0) {
+		case Kind::BULK: // '$' bulk string, '!' RESP3 bulk error, '=' RESP3 verbatim string ("txt:" prefix)
+			if (n < 0) {
 				reply.type = RedisReply::Type::RESP_NIL;
 				return true;
 			}
-			if (!ReadBulk(pos, length, reply.str)) {
+			if (!ReadBulk(pos, n, reply.str)) {
 				return false;
 			}
 			if (type == '!') {
@@ -314,138 +466,451 @@ private:
 				}
 			}
 			return true;
-		}
-		case '*':   // array
-		case '~':   // RESP3 set
-		case '>': { // RESP3 push
-			auto count = ParseInteger(rest);
-			if (count < 0) {
+		case Kind::AGGREGATE: // arrays, RESP3 sets/pushes, and maps flattened to [key, value, key, value, ...]
+			if (n < 0) {
 				reply.type = RedisReply::Type::RESP_NIL;
 				return true;
 			}
-			return ParseAggregate(pos, count, reply, depth);
-		}
-		case '%': { // RESP3 map, flattened to [key, value, key, value, ...]
-			auto count = ParseInteger(rest);
-			if (count < 0) {
-				reply.type = RedisReply::Type::RESP_NIL;
-				return true;
-			}
-			return ParseAggregate(pos, count * 2, reply, depth);
-		}
-		case '|': { // RESP3 attribute: skip it, the actual reply follows
-			auto count = ParseInteger(rest);
+			return ParseAggregate(pos, n, reply, depth);
+		case Kind::ATTRIBUTE: { // RESP3 attribute: skip it, the actual reply follows
 			RedisReply attributes;
-			if (!ParseAggregate(pos, count * 2, attributes, depth)) {
+			if (!ParseAggregate(pos, n, attributes, depth)) {
 				return false;
 			}
 			return ParseValue(pos, reply, depth);
 		}
-		default:
-			throw InvalidInputException("Redis protocol error: unknown reply type '%c'", type);
 		}
+		return false;
 	}
 
 	std::string buffer_;
 	size_t pos_ = 0;
+	// Completeness scan: position of the next header and the number of values still expected per nesting level
+	std::vector<int64_t> scan_stack_;
+	size_t scan_pos_ = 0;
+};
+
+//===--------------------------------------------------------------------===//
+// Connection settings
+//===--------------------------------------------------------------------===//
+static constexpr const char *REDIS_TIMEOUT_SETTING = "redis_timeout_ms";
+static constexpr int64_t REDIS_DEFAULT_TIMEOUT_MS = 30000;
+
+struct RedisConnectionConfig {
+	std::string host;
+	std::string port;
+	std::string username;
+	std::string password;
+	int64_t db = 0;
+	// Connect timeout, and the longest wait for reply data; 0 waits forever (the query can still be interrupted)
+	int64_t timeout_ms = REDIS_DEFAULT_TIMEOUT_MS;
+
+	// Pool key. It includes the credentials and database index, so a connection authenticated (and SELECTed)
+	// for one secret is never handed out for a secret with other credentials. Fields are length-prefixed so
+	// they can't run into each other. The key only lives in memory, like the secret itself.
+	std::string PoolKey() const {
+		std::string key;
+		for (auto *field : {&host, &port, &username, &password}) {
+			key += std::to_string(field->size());
+			key += ':';
+			key += *field;
+		}
+		key += std::to_string(db);
+		return key;
+	}
 };
 
 //===--------------------------------------------------------------------===//
 // Connections
 //===--------------------------------------------------------------------===//
+
+// The server closed a connection taken from the pool before replying (e.g. its idle timeout fired). The commands
+// were not processed, so they can be retried on a new connection.
+class RedisStaleConnectionError : public std::runtime_error {
+public:
+	explicit RedisStaleConnectionError(const std::string &msg) : std::runtime_error(msg) {
+	}
+};
+
+// One connection to a Redis server. All I/O is asynchronous on a private io_context, driven in short slices so
+// that every wait is bounded by the timeout and the query can be interrupted. A connection is used by one thread
+// at a time (it is checked out of the pool), so there is no lock around the I/O.
 class RedisConnection {
 public:
-	RedisConnection(const std::string &host, const std::string &port, const std::string &password = "")
-	    : io_context_(), socket_(io_context_) {
+	RedisConnection(const RedisConnectionConfig &config, ClientContext *context)
+	    : timeout_ms_(config.timeout_ms), socket_(io_context_) {
 		try {
-			tcp::resolver resolver(io_context_);
-			auto endpoints = resolver.resolve(host, port);
-			boost::asio::connect(socket_, endpoints);
-
-			if (!password.empty()) {
-				execute({"AUTH", password});
+			Connect(config, context);
+			if (!config.password.empty()) {
+				if (config.username.empty()) {
+					Execute({"AUTH", config.password}, context);
+				} else {
+					Execute({"AUTH", config.username, config.password}, context);
+				}
 			}
+			if (config.db != 0) {
+				Execute({"SELECT", std::to_string(config.db)}, context);
+			}
+		} catch (InterruptException &) {
+			throw;
 		} catch (std::exception &e) {
-			throw InvalidInputException("Redis connection error: %s", ErrorData(e).RawMessage());
+			throw IOException("Redis connection error: %s", ErrorData(e).RawMessage());
 		}
 	}
 
-	// Send a command and read its complete reply. Error replies throw unless allow_error is set.
-	RedisReply execute(const std::vector<std::string> &args, bool allow_error = false) {
-		RedisReply reply;
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			if (broken_) {
-				throw InvalidInputException("Redis execution error: connection is broken");
-			}
-			try {
-				boost::asio::write(socket_, boost::asio::buffer(RedisProtocol::formatCommand(args)));
-				char chunk[16384];
-				while (!parser_.TryParse(reply)) {
-					auto n = socket_.read_some(boost::asio::buffer(chunk, sizeof(chunk)));
-					parser_.Feed(chunk, n);
-				}
-			} catch (std::exception &e) {
-				// The stream position is unknown now, so the connection can't be reused
-				broken_ = true;
-				parser_.Reset();
-				boost::system::error_code ignored;
-				socket_.close(ignored);
-				throw InvalidInputException("Redis execution error: %s", ErrorData(e).RawMessage());
-			}
+	void SetTimeout(int64_t timeout_ms) {
+		timeout_ms_ = timeout_ms;
+	}
+
+	// Sends all commands in one write (pipelining) and reads one reply per command. Error replies are returned,
+	// not thrown. Throws RedisStaleConnectionError when the server had closed the connection before any reply
+	// byte arrived.
+	std::vector<RedisReply> ExecuteMany(const std::vector<std::vector<std::string>> &commands, ClientContext *context) {
+		if (broken_) {
+			throw IOException("Redis execution error: connection is broken");
 		}
+		std::vector<RedisReply> replies;
+		replies.reserve(commands.size());
+		bytes_received_ = 0;
+		try {
+			out_buffer_.clear();
+			for (auto &command : commands) {
+				RedisProtocol::AppendCommand(out_buffer_, command);
+			}
+			// Replies are read while the commands are still being written, so a large pipeline can't deadlock
+			// with both sides' socket buffers full
+			auto write_op = StartWrite();
+			for (size_t i = 0; i < commands.size(); i++) {
+				RedisReply reply;
+				while (!parser_.TryParse(reply)) {
+					Read(context, *write_op);
+				}
+				replies.push_back(std::move(reply));
+			}
+			// Every command was answered, so the write has finished
+			if (!write_op->done) {
+				Await(*write_op, context, "sending the command");
+			}
+			if (write_op->ec) {
+				ThrowIOError(write_op->ec);
+			}
+		} catch (InterruptException &) {
+			MarkBroken();
+			throw;
+		} catch (RedisStaleConnectionError &) {
+			MarkBroken();
+			throw;
+		} catch (std::exception &e) {
+			// The stream position is unknown now, so the connection can't be reused
+			MarkBroken();
+			throw IOException("Redis execution error: %s", ErrorData(e).RawMessage());
+		}
+		return replies;
+	}
+
+	// Sends one command and reads its reply. Error replies throw unless allow_error is set.
+	RedisReply Execute(const std::vector<std::string> &args, ClientContext *context, bool allow_error = false) {
+		auto replies = ExecuteMany({args}, context);
+		auto &reply = replies[0];
 		if (reply.IsError() && !allow_error) {
 			throw InvalidInputException("Redis error: %s", reply.str);
 		}
-		return reply;
+		return std::move(reply);
 	}
 
-	bool isBroken() {
-		std::lock_guard<std::mutex> lock(mutex_);
+	bool IsBroken() const {
 		return broken_;
 	}
 
+	std::chrono::steady_clock::time_point last_used;
+
 private:
+	struct PendingOp {
+		bool done = false;
+		boost::system::error_code ec;
+		size_t bytes = 0;
+	};
+
+	void MarkBroken() {
+		broken_ = true;
+		parser_.Reset();
+		boost::system::error_code ignored;
+		socket_.close(ignored);
+	}
+
+	// Runs the io_context until `op` completes, the timeout expires or the query is interrupted
+	void Await(PendingOp &op, ClientContext *context, const char *what) {
+		using clock = std::chrono::steady_clock;
+		const auto start = clock::now();
+		while (!op.done) {
+			auto slice = std::chrono::milliseconds(100);
+			if (timeout_ms_ > 0) {
+				auto remaining = std::chrono::milliseconds(timeout_ms_) -
+				                 std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start);
+				if (remaining.count() <= 0) {
+					MarkBroken();
+					throw IOException("timed out %s after %lld ms", what, (long long)timeout_ms_);
+				}
+				slice = std::min(slice, remaining);
+			}
+			io_context_.run_for(slice);
+			if (op.done) {
+				break;
+			}
+			if (context && context->IsInterrupted()) {
+				MarkBroken();
+				throw InterruptException();
+			}
+		}
+	}
+
+	void Connect(const RedisConnectionConfig &config, ClientContext *context) {
+		// Handlers hold the operation state by shared_ptr: after a timeout they may still run (or be destroyed)
+		// when this connection is torn down.
+		auto resolved = std::make_shared<PendingOp>();
+		auto endpoints = std::make_shared<tcp::resolver::results_type>();
+		tcp::resolver resolver(io_context_);
+		io_context_.restart();
+		resolver.async_resolve(
+		    config.host, config.port,
+		    [resolved, endpoints](const boost::system::error_code &ec, tcp::resolver::results_type results) {
+			    resolved->ec = ec;
+			    *endpoints = std::move(results);
+			    resolved->done = true;
+		    });
+		try {
+			Await(*resolved, context, "resolving the host");
+		} catch (...) {
+			resolver.cancel();
+			throw;
+		}
+		if (resolved->ec) {
+			throw IOException("could not resolve '%s': %s", config.host, resolved->ec.message());
+		}
+		auto connected = std::make_shared<PendingOp>();
+		io_context_.restart();
+		boost::asio::async_connect(socket_, *endpoints,
+		                           [connected](const boost::system::error_code &ec, const tcp::endpoint &) {
+			                           connected->ec = ec;
+			                           connected->done = true;
+		                           });
+		Await(*connected, context, "connecting");
+		if (connected->ec) {
+			MarkBroken();
+			throw IOException("%s", connected->ec.message());
+		}
+		boost::system::error_code ignored;
+		socket_.set_option(tcp::no_delay(true), ignored);
+	}
+
+	static bool IsDisconnect(const boost::system::error_code &ec) {
+		return ec == boost::asio::error::eof || ec == boost::asio::error::connection_reset ||
+		       ec == boost::asio::error::broken_pipe || ec == boost::asio::error::connection_aborted;
+	}
+
+	[[noreturn]] void ThrowIOError(const boost::system::error_code &ec) {
+		if (IsDisconnect(ec) && bytes_received_ == 0) {
+			throw RedisStaleConnectionError(ec.message());
+		}
+		throw IOException("%s", ec == boost::asio::error::eof ? "connection closed by the server" : ec.message());
+	}
+
+	// Starts writing out_buffer_; the write progresses while the io_context runs for the reads
+	std::shared_ptr<PendingOp> StartWrite() {
+		auto op = std::make_shared<PendingOp>();
+		io_context_.restart();
+		boost::asio::async_write(socket_, boost::asio::buffer(out_buffer_),
+		                         [op](const boost::system::error_code &ec, size_t n) {
+			                         op->ec = ec;
+			                         op->bytes = n;
+			                         op->done = true;
+		                         });
+		return op;
+	}
+
+	void Read(ClientContext *context, const PendingOp &write_op) {
+		auto op = std::make_shared<PendingOp>();
+		io_context_.restart();
+		socket_.async_read_some(boost::asio::buffer(in_buffer_), [op](const boost::system::error_code &ec, size_t n) {
+			op->ec = ec;
+			op->bytes = n;
+			op->done = true;
+		});
+		Await(*op, context, "waiting for a reply");
+		if (write_op.done && write_op.ec) {
+			ThrowIOError(write_op.ec);
+		}
+		if (op->ec) {
+			ThrowIOError(op->ec);
+		}
+		bytes_received_ += op->bytes;
+		parser_.Feed(in_buffer_.data(), op->bytes);
+	}
+
+	int64_t timeout_ms_;
+	// The I/O buffers are declared before the io_context so they outlive any handler still queued on it
+	std::array<char, 65536> in_buffer_;
+	std::string out_buffer_;
 	boost::asio::io_context io_context_;
 	tcp::socket socket_;
-	std::mutex mutex_;
 	RedisReplyParser parser_;
 	bool broken_ = false;
+	size_t bytes_received_ = 0;
 };
 
-// Connection pool manager
-class ConnectionPool {
+// Idle connections of one database, keyed by RedisConnectionConfig::PoolKey(). Lives in the database's object
+// cache, so it is per database instance and closed when the database shuts down. A connection is checked out for
+// exclusive use (a chunk of a scalar function, or a whole table function scan) and returned afterwards.
+class RedisConnectionPool : public ObjectCacheEntry {
 public:
-	static ConnectionPool &getInstance() {
-		static ConnectionPool instance;
-		return instance;
+	static constexpr size_t MAX_IDLE_PER_KEY = 8;
+	static constexpr int64_t MAX_IDLE_SECONDS = 120;
+
+	static std::string ObjectType() {
+		return "redis_connection_pool";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted
 	}
 
-	std::shared_ptr<RedisConnection> getConnection(const std::string &host, const std::string &port,
-	                                               const std::string &password = "") {
-		std::string key = host + ":" + port;
-		std::lock_guard<std::mutex> lock(mutex_);
-
-		auto it = connections_.find(key);
-		if (it == connections_.end() || it->second->isBroken()) {
-			auto conn = std::make_shared<RedisConnection>(host, port, password);
-			connections_[key] = conn;
-			return conn;
+	static shared_ptr<RedisConnectionPool> Get(ClientContext &context) {
+		auto pool =
+		    DatabaseInstance::GetDatabase(context).GetObjectCache().GetOrCreate<RedisConnectionPool>(ObjectType());
+		if (!pool) {
+			throw InternalException("Could not create the redis connection pool");
 		}
-		return it->second;
+		return pool;
+	}
+
+	// An idle connection for `key`, or nullptr
+	std::unique_ptr<RedisConnection> TakeIdle(const std::string &key) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		EvictExpired();
+		auto entry = idle_.find(key);
+		if (entry == idle_.end() || entry->second.empty()) {
+			return nullptr;
+		}
+		auto conn = std::move(entry->second.back());
+		entry->second.pop_back();
+		return conn;
+	}
+
+	void Return(const std::string &key, std::unique_ptr<RedisConnection> conn) {
+		if (!conn || conn->IsBroken()) {
+			return;
+		}
+		conn->last_used = std::chrono::steady_clock::now();
+		std::lock_guard<std::mutex> lock(mutex_);
+		EvictExpired();
+		auto &list = idle_[key];
+		if (list.size() < MAX_IDLE_PER_KEY) {
+			list.push_back(std::move(conn));
+		}
 	}
 
 private:
-	ConnectionPool() {
+	void EvictExpired() {
+		auto now = std::chrono::steady_clock::now();
+		for (auto it = idle_.begin(); it != idle_.end();) {
+			auto &list = it->second;
+			list.erase(std::remove_if(list.begin(), list.end(),
+			                          [&](const std::unique_ptr<RedisConnection> &conn) {
+				                          return now - conn->last_used > std::chrono::seconds(MAX_IDLE_SECONDS);
+			                          }),
+			           list.end());
+			it = list.empty() ? idle_.erase(it) : std::next(it);
+		}
 	}
+
 	std::mutex mutex_;
-	std::unordered_map<std::string, std::shared_ptr<RedisConnection>> connections_;
+	std::unordered_map<std::string, std::vector<std::unique_ptr<RedisConnection>>> idle_;
 };
 
+// A connection checked out of the pool for exclusive use; returned to the pool when the session ends. Retries once
+// on a new connection when a pooled connection turns out to have been closed by the server.
+class RedisSession {
+public:
+	RedisSession(ClientContext &context, RedisConnectionConfig config_p)
+	    : pool_(RedisConnectionPool::Get(context)), config_(std::move(config_p)), key_(config_.PoolKey()) {
+		conn_ = pool_->TakeIdle(key_);
+		reused_ = conn_ != nullptr;
+		if (conn_) {
+			conn_->SetTimeout(config_.timeout_ms);
+		} else {
+			conn_ = std::unique_ptr<RedisConnection>(new RedisConnection(config_, &context));
+		}
+	}
+
+	~RedisSession() {
+		if (!discard_) {
+			pool_->Return(key_, std::move(conn_));
+		}
+	}
+
+	// Close the connection when the session ends instead of returning it to the pool (used after arbitrary
+	// commands, which may have changed the connection's state, e.g. SELECT or SUBSCRIBE)
+	void Discard() {
+		discard_ = true;
+	}
+
+	std::vector<RedisReply> ExecuteMany(const std::vector<std::vector<std::string>> &commands, ClientContext &context) {
+		try {
+			return conn_->ExecuteMany(commands, &context);
+		} catch (RedisStaleConnectionError &e) {
+			if (!reused_) {
+				throw IOException("Redis execution error: connection closed by the server (%s)", e.what());
+			}
+		}
+		// The pooled connection had gone stale; retry once on a fresh one
+		reused_ = false;
+		conn_ = std::unique_ptr<RedisConnection>(new RedisConnection(config_, &context));
+		try {
+			return conn_->ExecuteMany(commands, &context);
+		} catch (RedisStaleConnectionError &e) {
+			throw IOException("Redis execution error: connection closed by the server (%s)", e.what());
+		}
+	}
+
+	RedisReply Execute(const std::vector<std::string> &args, ClientContext &context, bool allow_error = false) {
+		auto replies = ExecuteMany({args}, context);
+		auto &reply = replies[0];
+		if (reply.IsError() && !allow_error) {
+			throw InvalidInputException("Redis error: %s", reply.str);
+		}
+		return std::move(reply);
+	}
+
+private:
+	shared_ptr<RedisConnectionPool> pool_;
+	RedisConnectionConfig config_;
+	std::string key_;
+	std::unique_ptr<RedisConnection> conn_;
+	bool reused_ = false;
+	bool discard_ = false;
+};
+
+// Redis functions open network connections, so they are refused when external access is disabled
+static void CheckExternalAccess(ClientContext &context) {
+	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
+		throw PermissionException("Redis functions are disabled because enable_external_access is false");
+	}
+}
+
+static int64_t GetTimeoutSetting(ClientContext &context) {
+	Value value;
+	if (context.TryGetCurrentSetting(REDIS_TIMEOUT_SETTING, value) && !value.IsNull()) {
+		return value.GetValue<int64_t>();
+	}
+	return REDIS_DEFAULT_TIMEOUT_MS;
+}
+
 // Looks up a redis secret by name and reads its connection settings. Throws if the secret doesn't exist or lacks
-// host/port. The password is optional; without one the connection is made without AUTH.
-static void GetRedisSecret(ClientContext &context, const string &secret_name, string &host, string &port,
-                           string &password) {
+// host/port. The password, username, db and timeout_ms are optional.
+static RedisConnectionConfig GetRedisConfig(ClientContext &context, const string &secret_name) {
+	CheckExternalAccess(context);
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	// Look the secret up by name. LookupSecret() matches by scope, so an unscoped redis secret would be returned
@@ -456,33 +921,47 @@ static void GetRedisSecret(ClientContext &context, const string &secret_name, st
 	}
 	auto &secret = *secret_entry->secret;
 	if (secret.GetType() != "redis") {
-		throw InvalidInputException("Invalid secret type. Expected 'redis', got '%s'", secret.GetType());
+		throw InvalidInputException("Invalid secret type. Expected 'redis', got '%s'",
+		                            secret.GetType().GetIdentifierName());
 	}
 	const auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&secret);
 	if (!kv_secret) {
 		throw InvalidInputException("Invalid secret format for 'redis' secret");
 	}
 
-	Value host_val, port_val, password_val;
-	if (!kv_secret->TryGetValue("host", host_val) || host_val.IsNull()) {
+	RedisConnectionConfig config;
+	Value value;
+	if (!kv_secret->TryGetValue("host", value) || value.IsNull()) {
 		throw InvalidInputException("Redis secret '%s' is missing required key 'host'", secret_name);
 	}
-	if (!kv_secret->TryGetValue("port", port_val) || port_val.IsNull()) {
+	config.host = value.ToString();
+	if (!kv_secret->TryGetValue("port", value) || value.IsNull()) {
 		throw InvalidInputException("Redis secret '%s' is missing required key 'port'", secret_name);
 	}
-	host = host_val.ToString();
-	port = port_val.ToString();
-	if (kv_secret->TryGetValue("password", password_val) && !password_val.IsNull()) {
-		password = password_val.ToString();
-	} else {
-		password.clear();
+	config.port = value.ToString();
+	if (kv_secret->TryGetValue("password", value) && !value.IsNull()) {
+		config.password = value.ToString();
 	}
-}
-
-static std::shared_ptr<RedisConnection> GetRedisConnection(ClientContext &context, const string &secret_name) {
-	string host, port, password;
-	GetRedisSecret(context, secret_name, host, port, password);
-	return ConnectionPool::getInstance().getConnection(host, port, password);
+	if (kv_secret->TryGetValue("username", value) && !value.IsNull()) {
+		config.username = value.ToString();
+		if (config.password.empty()) {
+			throw InvalidInputException("Redis secret '%s' sets 'username' but no 'password'", secret_name);
+		}
+	}
+	if (kv_secret->TryGetValue("db", value) && !value.IsNull()) {
+		config.db = value.GetValue<int64_t>();
+		if (config.db < 0) {
+			throw InvalidInputException("Redis secret '%s': 'db' must be 0 or greater", secret_name);
+		}
+	}
+	config.timeout_ms = GetTimeoutSetting(context);
+	if (kv_secret->TryGetValue("timeout_ms", value) && !value.IsNull()) {
+		config.timeout_ms = value.GetValue<int64_t>();
+	}
+	if (config.timeout_ms < 0) {
+		throw InvalidInputException("Redis timeout must be 0 (no timeout) or a positive number of milliseconds");
+	}
+	return config;
 }
 
 //===--------------------------------------------------------------------===//
@@ -492,7 +971,7 @@ static std::shared_ptr<RedisConnection> GetRedisConnection(ClientContext &contex
 // Per-row access to the arguments of a scalar function
 class RedisArgs {
 public:
-	explicit RedisArgs(DataChunk &args) : formats_(args.ColumnCount()) {
+	explicit RedisArgs(DataChunk &args) : args_(args), formats_(args.ColumnCount()) {
 		for (idx_t col = 0; col < args.ColumnCount(); col++) {
 			ToUnified(args.data[col], args.size(), formats_[col]);
 		}
@@ -517,44 +996,154 @@ public:
 		return UnifiedVectorFormat::GetData<int64_t>(format)[format.sel->get_index(row)];
 	}
 
+	// A VARCHAR[] argument; NULL elements are rejected
+	std::vector<std::string> GetStringList(idx_t col, idx_t row, const char *what) const {
+		auto list = args_.data[col].GetValue(row);
+		std::vector<std::string> result;
+		for (auto &element : ListValue::GetChildren(list)) {
+			if (element.IsNull()) {
+				throw InvalidInputException("%s must not contain NULL", what);
+			}
+			result.push_back(element.GetValue<string>());
+		}
+		return result;
+	}
+
 private:
+	DataChunk &args_;
 	vector<UnifiedVectorFormat> formats_;
+};
+
+// Writes results of nested types (LIST, STRUCT, MAP) row by row
+class RedisValueWriter {
+public:
+	RedisValueWriter(Vector &result, idx_t count) : result_(result) {
+		(void)count;
+	}
+	void Write(const Value &value) {
+		result_.SetValue(row_++, value);
+	}
+	void WriteNull() {
+		result_.SetValue(row_++, Value(result_.GetType()));
+	}
+
+private:
+	Vector &result_;
+	idx_t row_ = 0;
 };
 
 template <class T>
 struct RedisResultValue {
 	using type = T;
+	using writer = RedisResultWriter<T>;
 };
 template <>
 struct RedisResultValue<string_t> {
 	using type = std::string;
+	using writer = RedisResultWriter<string_t>;
+};
+template <>
+struct RedisResultValue<Value> {
+	using type = Value;
+	using writer = RedisValueWriter;
 };
 
-// Runs `op` for every row. The secret name is always the last argument and is read per row; connections are
-// looked up once per distinct secret. A NULL argument gives a NULL result. `op` returns false for a NULL result.
-template <class T, class OP>
-static void RedisExecute(DataChunk &args, ExpressionState &state, Vector &result, const char *command, OP op) {
+static RedisReply EmptyArrayReply() {
+	RedisReply reply;
+	reply.type = RedisReply::Type::RESP_ARRAY;
+	return reply;
+}
+
+// Runs a Redis command for every row. The secret name is always the last argument and is read per row. A NULL
+// argument gives a NULL result.
+//
+// `build(in, row, command)` fills in the command for a row; returning false skips the server and hands `convert`
+// an empty array reply. The commands of a chunk are pipelined: one write and one round trip per distinct secret.
+// `convert(in, row, reply, value)` turns a reply into the result; it returns false for a NULL result. Error replies
+// raise an error for the first failing row.
+template <class T, class BUILD, class CONVERT>
+static void RedisExecute(DataChunk &args, ExpressionState &state, Vector &result, const char *command, BUILD build,
+                         CONVERT convert, bool discard_connections = false) {
+	auto &context = state.GetContext();
 	const idx_t count = args.size();
 	const idx_t secret_col = args.ColumnCount() - 1;
 	RedisArgs input(args);
-	std::unordered_map<std::string, std::shared_ptr<RedisConnection>> connections;
-	RedisResultWriter<T> writer(result, count);
+
+	struct Batch {
+		RedisConnectionConfig config;
+		std::unique_ptr<RedisSession> session;
+		std::vector<std::vector<std::string>> commands;
+		std::vector<RedisReply> replies;
+	};
+	std::vector<Batch> batches;
+	std::unordered_map<std::string, idx_t> batch_of_secret;
+	// Per row: the batch and the reply index in it; INVALID_INDEX batch for rows without a command
+	std::vector<std::pair<idx_t, idx_t>> row_reply(count, {DConstants::INVALID_INDEX, 0});
+
+	auto wrap_error = [&](std::exception &e) -> InvalidInputException {
+		return InvalidInputException("Redis %s error: %s", command, ErrorData(e).RawMessage());
+	};
+	try {
+		for (idx_t row = 0; row < count; row++) {
+			if (input.AnyNull(row)) {
+				continue;
+			}
+			// Validate the arguments before connecting
+			std::vector<std::string> cmd;
+			const bool send = build(input, row, cmd);
+			auto secret_name = input.GetString(secret_col, row);
+			auto entry = batch_of_secret.find(secret_name);
+			if (entry == batch_of_secret.end()) {
+				Batch batch;
+				batch.config = GetRedisConfig(context, secret_name);
+				batches.push_back(std::move(batch));
+				entry = batch_of_secret.emplace(secret_name, batches.size() - 1).first;
+			}
+			auto &batch = batches[entry->second];
+			if (!send) {
+				continue;
+			}
+			row_reply[row] = {entry->second, batch.commands.size()};
+			batch.commands.push_back(std::move(cmd));
+		}
+		for (auto &batch : batches) {
+			if (batch.commands.empty()) {
+				continue;
+			}
+			// Connect only for secrets that have commands to run
+			batch.session.reset(new RedisSession(context, batch.config));
+			if (discard_connections) {
+				batch.session->Discard();
+			}
+			batch.replies = batch.session->ExecuteMany(batch.commands, context);
+		}
+	} catch (InterruptException &) {
+		throw;
+	} catch (PermissionException &) {
+		throw;
+	} catch (std::exception &e) {
+		throw wrap_error(e);
+	}
+
+	typename RedisResultValue<T>::writer writer(result, count);
+	const auto empty_reply = EmptyArrayReply();
 	for (idx_t row = 0; row < count; row++) {
 		if (input.AnyNull(row)) {
 			writer.WriteNull();
 			continue;
 		}
+		auto &location = row_reply[row];
+		auto &reply = location.first == DConstants::INVALID_INDEX ? empty_reply
+		                                                          : batches[location.first].replies[location.second];
 		typename RedisResultValue<T>::type value;
 		bool valid;
 		try {
-			auto secret_name = input.GetString(secret_col, row);
-			auto entry = connections.find(secret_name);
-			if (entry == connections.end()) {
-				entry = connections.emplace(secret_name, GetRedisConnection(state.GetContext(), secret_name)).first;
+			if (reply.IsError()) {
+				throw InvalidInputException("Redis error: %s", reply.str);
 			}
-			valid = op(input, row, *entry->second, value);
+			valid = convert(input, row, reply, value);
 		} catch (std::exception &e) {
-			throw InvalidInputException("Redis %s error: %s", command, ErrorData(e).RawMessage());
+			throw wrap_error(e);
 		}
 		if (valid) {
 			writer.Write(value);
@@ -575,101 +1164,170 @@ static std::string JoinStrings(const std::vector<std::string> &values, const std
 	return joined;
 }
 
+using RedisCommand = std::vector<std::string>;
+
+// Reply conversions
+static bool NullableString(const RedisReply &reply, std::string &out) {
+	if (reply.IsNil()) {
+		return false;
+	}
+	out = reply.AsString();
+	return true;
+}
+
+static std::vector<std::string> ReplyStrings(const RedisReply &reply) {
+	std::vector<std::string> values;
+	for (auto &element : reply.AsArray()) {
+		values.push_back(element.AsString());
+	}
+	return values;
+}
+
+static Value StringList(const std::vector<std::string> &values) {
+	vector<Value> list;
+	list.reserve(values.size());
+	for (auto &value : values) {
+		list.emplace_back(value);
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(list));
+}
+
+// field/value pairs as a MAP; a field repeated within the reply keeps its first value
+static Value StringMap(const std::vector<std::string> &kvs) {
+	vector<Value> keys, values;
+	std::unordered_set<std::string> seen;
+	for (size_t i = 0; i + 1 < kvs.size(); i += 2) {
+		if (seen.insert(kvs[i]).second) {
+			keys.emplace_back(kvs[i]);
+			values.emplace_back(kvs[i + 1]);
+		}
+	}
+	return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(keys), std::move(values));
+}
+
+static LogicalType StringMapType() {
+	return LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+}
+
+static LogicalType ScanPageType() {
+	child_list_t<LogicalType> children;
+	children.emplace_back(Identifier("cursor"), LogicalType::VARCHAR);
+	children.emplace_back(Identifier("keys"), LogicalType::LIST(LogicalType::VARCHAR));
+	return LogicalType::STRUCT(std::move(children));
+}
+
+static LogicalType HScanPageType() {
+	child_list_t<LogicalType> children;
+	children.emplace_back(Identifier("cursor"), LogicalType::VARCHAR);
+	children.emplace_back(Identifier("entries"), StringMapType());
+	return LogicalType::STRUCT(std::move(children));
+}
+
 // redis_get(key, secret) -> VARCHAR, NULL when the key does not exist
 static void RedisGetFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<string_t>(args, state, result, "GET",
-	                       [](const RedisArgs &in, idx_t row, RedisConnection &conn, std::string &out) {
-		                       auto reply = conn.execute({"GET", in.GetString(0, row)});
-		                       if (reply.IsNil()) {
-			                       return false;
-		                       }
-		                       out = reply.AsString();
-		                       return true;
-	                       });
+	RedisExecute<string_t>(
+	    args, state, result, "GET",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"GET", in.GetString(0, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) { return NullableString(reply, out); });
 }
 
 // redis_set(key, value, secret) -> VARCHAR ('OK')
 static void RedisSetFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<string_t>(args, state, result, "SET",
-	                       [](const RedisArgs &in, idx_t row, RedisConnection &conn, std::string &out) {
-		                       auto reply = conn.execute({"SET", in.GetString(0, row), in.GetString(1, row)});
-		                       if (reply.IsNil()) {
-			                       return false;
-		                       }
-		                       out = reply.AsString();
-		                       return true;
-	                       });
+	RedisExecute<string_t>(
+	    args, state, result, "SET",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"SET", in.GetString(0, row), in.GetString(1, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) { return NullableString(reply, out); });
 }
 
 // redis_hget(key, field, secret) -> VARCHAR, NULL when the field does not exist
 static void RedisHGetFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<string_t>(args, state, result, "HGET",
-	                       [](const RedisArgs &in, idx_t row, RedisConnection &conn, std::string &out) {
-		                       auto reply = conn.execute({"HGET", in.GetString(0, row), in.GetString(1, row)});
-		                       if (reply.IsNil()) {
-			                       return false;
-		                       }
-		                       out = reply.AsString();
-		                       return true;
-	                       });
+	RedisExecute<string_t>(
+	    args, state, result, "HGET",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"HGET", in.GetString(0, row), in.GetString(1, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) { return NullableString(reply, out); });
+}
+
+static bool IntegerReply(const RedisReply &reply, int64_t &out) {
+	out = reply.AsInteger();
+	return true;
 }
 
 // redis_hset(key, field, value, secret) -> BIGINT (number of fields added)
 static void RedisHSetFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	RedisExecute<int64_t>(
-	    args, state, result, "HSET", [](const RedisArgs &in, idx_t row, RedisConnection &conn, int64_t &out) {
-		    out = conn.execute({"HSET", in.GetString(0, row), in.GetString(1, row), in.GetString(2, row)}).AsInteger();
+	    args, state, result, "HSET",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"HSET", in.GetString(0, row), in.GetString(1, row), in.GetString(2, row)};
 		    return true;
-	    });
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, int64_t &out) { return IntegerReply(reply, out); });
 }
 
 // redis_lpush(key, value, secret) -> BIGINT (list length after the push)
 static void RedisLPushFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<int64_t>(args, state, result, "LPUSH",
-	                      [](const RedisArgs &in, idx_t row, RedisConnection &conn, int64_t &out) {
-		                      out = conn.execute({"LPUSH", in.GetString(0, row), in.GetString(1, row)}).AsInteger();
-		                      return true;
-	                      });
+	RedisExecute<int64_t>(
+	    args, state, result, "LPUSH",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"LPUSH", in.GetString(0, row), in.GetString(1, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, int64_t &out) { return IntegerReply(reply, out); });
+}
+
+static bool BuildLRange(const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+	cmd = {"LRANGE", in.GetString(0, row), std::to_string(in.GetBigint(1, row)), std::to_string(in.GetBigint(2, row))};
+	return true;
 }
 
 // redis_lrange(key, start, stop, secret) -> VARCHAR (comma-separated elements)
 static void RedisLRangeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<string_t>(
-	    args, state, result, "LRANGE", [](const RedisArgs &in, idx_t row, RedisConnection &conn, std::string &out) {
-		    auto reply = conn.execute({"LRANGE", in.GetString(0, row), std::to_string(in.GetBigint(1, row)),
-		                               std::to_string(in.GetBigint(2, row))});
-		    std::vector<std::string> values;
-		    for (auto &element : reply.AsArray()) {
-			    values.push_back(element.AsString());
-		    }
-		    out = JoinStrings(values, ",");
-		    return true;
-	    });
+	RedisExecute<string_t>(args, state, result, "LRANGE", BuildLRange,
+	                       [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) {
+		                       out = JoinStrings(ReplyStrings(reply), ",");
+		                       return true;
+	                       });
+}
+
+// redis_lrange_list(key, start, stop, secret) -> VARCHAR[]
+static void RedisLRangeListFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	RedisExecute<Value>(args, state, result, "LRANGE", BuildLRange,
+	                    [](const RedisArgs &, idx_t, const RedisReply &reply, Value &out) {
+		                    out = StringList(ReplyStrings(reply));
+		                    return true;
+	                    });
 }
 
 // redis_mget(keys, secret) -> VARCHAR (comma-separated values, empty for missing keys so positions line up)
 static void RedisMGetFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	RedisExecute<string_t>(
-	    args, state, result, "MGET", [](const RedisArgs &in, idx_t row, RedisConnection &conn, std::string &out) {
-		    std::vector<std::string> command {"MGET"};
+	    args, state, result, "MGET",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"MGET"};
 		    std::string key_list = in.GetString(0, row);
 		    size_t start = 0;
 		    while (true) {
 			    auto comma = key_list.find(',', start);
 			    auto key = key_list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
 			    if (!key.empty()) {
-				    command.push_back(key);
+				    cmd.push_back(key);
 			    }
 			    if (comma == std::string::npos) {
 				    break;
 			    }
 			    start = comma + 1;
 		    }
-		    if (command.size() == 1) {
-			    out = "";
-			    return true;
-		    }
-		    auto reply = conn.execute(command);
+		    return cmd.size() > 1;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) {
 		    std::vector<std::string> values;
 		    for (auto &element : reply.AsArray()) {
 			    values.push_back(element.IsNil() ? std::string() : element.AsString());
@@ -679,12 +1337,38 @@ static void RedisMGetFunction(DataChunk &args, ExpressionState &state, Vector &r
 	    });
 }
 
+// redis_mget_list(keys VARCHAR[], secret) -> VARCHAR[] (NULL elements for missing keys)
+static void RedisMGetListFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	RedisExecute<Value>(
+	    args, state, result, "MGET",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    auto keys = in.GetStringList(0, row, "redis_mget_list keys");
+		    if (keys.empty()) {
+			    return false;
+		    }
+		    cmd = {"MGET"};
+		    cmd.insert(cmd.end(), keys.begin(), keys.end());
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, Value &out) {
+		    vector<Value> values;
+		    for (auto &element : reply.AsArray()) {
+			    values.push_back(element.IsNil() ? Value(LogicalType::VARCHAR) : Value(element.AsString()));
+		    }
+		    out = Value::LIST(LogicalType::VARCHAR, std::move(values));
+		    return true;
+	    });
+}
+
+static bool BuildScan(const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+	cmd = {"SCAN", in.GetString(0, row), "MATCH", in.GetString(1, row), "COUNT", std::to_string(in.GetBigint(2, row))};
+	return true;
+}
+
 // redis_scan(cursor, pattern, count, secret) -> VARCHAR ('next_cursor:key1,key2,...')
 static void RedisScanFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<string_t>(args, state, result, "SCAN",
-	                       [](const RedisArgs &in, idx_t row, RedisConnection &conn, std::string &out) {
-		                       auto reply = conn.execute({"SCAN", in.GetString(0, row), "MATCH", in.GetString(1, row),
-		                                                  "COUNT", std::to_string(in.GetBigint(2, row))});
+	RedisExecute<string_t>(args, state, result, "SCAN", BuildScan,
+	                       [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) {
 		                       std::string cursor;
 		                       std::vector<std::string> keys;
 		                       reply.AsScanReply(cursor, keys);
@@ -693,75 +1377,238 @@ static void RedisScanFunction(DataChunk &args, ExpressionState &state, Vector &r
 	                       });
 }
 
+// redis_scan_page(cursor, pattern, count, secret) -> STRUCT(cursor VARCHAR, keys VARCHAR[])
+static void RedisScanPageFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	RedisExecute<Value>(args, state, result, "SCAN", BuildScan,
+	                    [](const RedisArgs &, idx_t, const RedisReply &reply, Value &out) {
+		                    std::string cursor;
+		                    std::vector<std::string> keys;
+		                    reply.AsScanReply(cursor, keys);
+		                    child_list_t<Value> fields;
+		                    fields.emplace_back(Identifier("cursor"), Value(cursor));
+		                    fields.emplace_back(Identifier("keys"), StringList(keys));
+		                    out = Value::STRUCT(std::move(fields));
+		                    return true;
+	                    });
+}
+
+static bool BuildHScan(const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+	cmd = {"HSCAN",
+	       in.GetString(0, row),
+	       in.GetString(1, row),
+	       "MATCH",
+	       in.GetString(2, row),
+	       "COUNT",
+	       std::to_string(in.GetBigint(3, row))};
+	return true;
+}
+
 // redis_hscan(key, cursor, pattern, count, secret) -> VARCHAR ('next_cursor:field1=value1,field2=value2,...')
 static void RedisHScanFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<string_t>(
-	    args, state, result, "HSCAN", [](const RedisArgs &in, idx_t row, RedisConnection &conn, std::string &out) {
-		    auto reply = conn.execute({"HSCAN", in.GetString(0, row), in.GetString(1, row), "MATCH",
-		                               in.GetString(2, row), "COUNT", std::to_string(in.GetBigint(3, row))});
-		    std::string cursor;
-		    std::vector<std::string> kvs;
-		    reply.AsScanReply(cursor, kvs);
-		    std::vector<std::string> pairs;
-		    for (size_t i = 0; i + 1 < kvs.size(); i += 2) {
-			    pairs.push_back(kvs[i] + "=" + kvs[i + 1]);
-		    }
-		    out = cursor + ":" + JoinStrings(pairs, ",");
+	RedisExecute<string_t>(args, state, result, "HSCAN", BuildHScan,
+	                       [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) {
+		                       std::string cursor;
+		                       std::vector<std::string> kvs;
+		                       reply.AsScanReply(cursor, kvs);
+		                       std::vector<std::string> pairs;
+		                       for (size_t i = 0; i + 1 < kvs.size(); i += 2) {
+			                       pairs.push_back(kvs[i] + "=" + kvs[i + 1]);
+		                       }
+		                       out = cursor + ":" + JoinStrings(pairs, ",");
+		                       return true;
+	                       });
+}
+
+// redis_hscan_page(key, cursor, pattern, count, secret) -> STRUCT(cursor VARCHAR, entries MAP(VARCHAR, VARCHAR))
+static void RedisHScanPageFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	RedisExecute<Value>(args, state, result, "HSCAN", BuildHScan,
+	                    [](const RedisArgs &, idx_t, const RedisReply &reply, Value &out) {
+		                    std::string cursor;
+		                    std::vector<std::string> kvs;
+		                    reply.AsScanReply(cursor, kvs);
+		                    child_list_t<Value> fields;
+		                    fields.emplace_back(Identifier("cursor"), Value(cursor));
+		                    fields.emplace_back(Identifier("entries"), StringMap(kvs));
+		                    out = Value::STRUCT(std::move(fields));
+		                    return true;
+	                    });
+}
+
+// redis_hgetall_map(key, secret) -> MAP(VARCHAR, VARCHAR) (empty map when the key does not exist)
+static void RedisHGetAllMapFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	RedisExecute<Value>(
+	    args, state, result, "HGETALL",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"HGETALL", in.GetString(0, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, Value &out) {
+		    out = StringMap(ReplyStrings(reply));
 		    return true;
 	    });
 }
 
+static void AppendJsonString(std::string &out, const std::string &value) {
+	out += '"';
+	for (unsigned char c : value) {
+		switch (c) {
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
+		default:
+			if (c < 0x20) {
+				char escaped[8];
+				snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+				out += escaped;
+			} else {
+				out += static_cast<char>(c);
+			}
+		}
+	}
+	out += '"';
+}
+
+static void AppendJson(std::string &out, const RedisReply &reply) {
+	switch (reply.type) {
+	case RedisReply::Type::RESP_STRING:
+	case RedisReply::Type::RESP_STATUS:
+	case RedisReply::Type::RESP_ERROR:
+		AppendJsonString(out, reply.str);
+		break;
+	case RedisReply::Type::RESP_INTEGER:
+		out += std::to_string(reply.integer);
+		break;
+	case RedisReply::Type::RESP_NIL:
+		out += "null";
+		break;
+	case RedisReply::Type::RESP_ARRAY:
+		out += '[';
+		for (size_t i = 0; i < reply.elements.size(); i++) {
+			if (i > 0) {
+				out += ',';
+			}
+			AppendJson(out, reply.elements[i]);
+		}
+		out += ']';
+		break;
+	}
+}
+
+// redis_command(args VARCHAR[], secret) -> VARCHAR: runs any command. Strings and integers are returned as text,
+// nil as NULL, and arrays (also RESP3 maps and sets, flattened) as JSON arrays.
+static void RedisCommandFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	RedisExecute<string_t>(
+	    args, state, result, "command",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = in.GetStringList(0, row, "redis_command args");
+		    if (cmd.empty()) {
+			    throw InvalidInputException("redis_command needs at least the command name");
+		    }
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) {
+		    if (reply.IsNil()) {
+			    return false;
+		    }
+		    if (reply.type == RedisReply::Type::RESP_ARRAY) {
+			    out.clear();
+			    AppendJson(out, reply);
+		    } else {
+			    out = reply.AsString();
+		    }
+		    return true;
+	    },
+	    true);
+}
+
+static bool ConvertPositive(const RedisReply &reply, bool &out) {
+	out = reply.AsInteger() > 0;
+	return true;
+}
+
 // redis_del(key, secret) -> BOOLEAN
 static void RedisDelFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<bool>(args, state, result, "DEL",
-	                   [](const RedisArgs &in, idx_t row, RedisConnection &conn, bool &out) {
-		                   out = conn.execute({"DEL", in.GetString(0, row)}).AsInteger() > 0;
-		                   return true;
-	                   });
+	RedisExecute<bool>(
+	    args, state, result, "DEL",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"DEL", in.GetString(0, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, bool &out) { return ConvertPositive(reply, out); });
 }
 
 // redis_exists(key, secret) -> BOOLEAN
 static void RedisExistsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<bool>(args, state, result, "EXISTS",
-	                   [](const RedisArgs &in, idx_t row, RedisConnection &conn, bool &out) {
-		                   out = conn.execute({"EXISTS", in.GetString(0, row)}).AsInteger() > 0;
-		                   return true;
-	                   });
+	RedisExecute<bool>(
+	    args, state, result, "EXISTS",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"EXISTS", in.GetString(0, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, bool &out) { return ConvertPositive(reply, out); });
 }
 
 // redis_type(key, secret) -> VARCHAR
 static void RedisTypeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<string_t>(args, state, result, "TYPE",
-	                       [](const RedisArgs &in, idx_t row, RedisConnection &conn, std::string &out) {
-		                       out = conn.execute({"TYPE", in.GetString(0, row)}).AsString();
-		                       return true;
-	                       });
+	RedisExecute<string_t>(
+	    args, state, result, "TYPE",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"TYPE", in.GetString(0, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, std::string &out) {
+		    out = reply.AsString();
+		    return true;
+	    });
 }
 
 // redis_expire(key, seconds, secret) -> BOOLEAN
 static void RedisExpireFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	RedisExecute<bool>(
-	    args, state, result, "EXPIRE", [](const RedisArgs &in, idx_t row, RedisConnection &conn, bool &out) {
-		    out = conn.execute({"EXPIRE", in.GetString(0, row), std::to_string(in.GetBigint(1, row))}).AsInteger() == 1;
+	    args, state, result, "EXPIRE",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"EXPIRE", in.GetString(0, row), std::to_string(in.GetBigint(1, row))};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, bool &out) {
+		    out = reply.AsInteger() == 1;
 		    return true;
 	    });
 }
 
 // redis_ttl(key, secret) -> BIGINT (-2 if the key does not exist, -1 if it has no expiry)
 static void RedisTTLFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	RedisExecute<int64_t>(args, state, result, "TTL",
-	                      [](const RedisArgs &in, idx_t row, RedisConnection &conn, int64_t &out) {
-		                      out = conn.execute({"TTL", in.GetString(0, row)}).AsInteger();
-		                      return true;
-	                      });
+	RedisExecute<int64_t>(
+	    args, state, result, "TTL",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"TTL", in.GetString(0, row)};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, int64_t &out) { return IntegerReply(reply, out); });
 }
 
 // redis_expireat(key, timestamp, secret) -> BOOLEAN
 static void RedisExpireAtFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	RedisExecute<bool>(
-	    args, state, result, "EXPIREAT", [](const RedisArgs &in, idx_t row, RedisConnection &conn, bool &out) {
-		    out =
-		        conn.execute({"EXPIREAT", in.GetString(0, row), std::to_string(in.GetBigint(1, row))}).AsInteger() == 1;
+	    args, state, result, "EXPIREAT",
+	    [](const RedisArgs &in, idx_t row, RedisCommand &cmd) {
+		    cmd = {"EXPIREAT", in.GetString(0, row), std::to_string(in.GetBigint(1, row))};
+		    return true;
+	    },
+	    [](const RedisArgs &, idx_t, const RedisReply &reply, bool &out) {
+		    out = reply.AsInteger() == 1;
 		    return true;
 	    });
 }
@@ -770,13 +1617,15 @@ static void RedisExpireAtFunction(DataChunk &args, ExpressionState &state, Vecto
 // Table functions (bind data holds the arguments, iteration state lives in the global state)
 //===--------------------------------------------------------------------===//
 struct RedisTableBindData : public TableFunctionData {
-	std::string host, port, password;
+	RedisConnectionConfig config;
 
 	void LookupSecret(ClientContext &context, const std::string &secret_name) {
-		GetRedisSecret(context, secret_name, host, port, password);
+		config = GetRedisConfig(context, secret_name);
 	}
-	std::shared_ptr<RedisConnection> Connect() const {
-		return ConnectionPool::getInstance().getConnection(host, port, password);
+	// A connection for one scan, checked out of the pool until the scan's global state is destroyed
+	std::unique_ptr<RedisSession> Connect(ClientContext &context) const {
+		CheckExternalAccess(context);
+		return std::unique_ptr<RedisSession>(new RedisSession(context, config));
 	}
 };
 
@@ -788,7 +1637,7 @@ struct RedisHScanOverScanBindData : public RedisTableBindData {
 };
 
 struct RedisHScanOverScanState : public GlobalTableFunctionState {
-	std::shared_ptr<RedisConnection> conn;
+	std::unique_ptr<RedisSession> conn;
 	// SCAN over the keys
 	std::string scan_cursor = "0";
 	bool scan_done = false;
@@ -820,7 +1669,7 @@ static unique_ptr<FunctionData> RedisHScanOverScanBind(ClientContext &context, T
 static unique_ptr<GlobalTableFunctionState> RedisHScanOverScanInit(ClientContext &context,
                                                                    TableFunctionInitInput &input) {
 	auto state = make_uniq<RedisHScanOverScanState>();
-	state->conn = input.bind_data->Cast<RedisHScanOverScanBindData>().Connect();
+	state->conn = input.bind_data->Cast<RedisHScanOverScanBindData>().Connect(context);
 	return std::move(state);
 }
 
@@ -845,8 +1694,8 @@ static void RedisHScanOverScanFunction(ClientContext &context, TableFunctionInpu
 		}
 		// Fetch the next HSCAN page of the current key
 		if (state.have_key && !state.hscan_done) {
-			auto reply = state.conn->execute(
-			    {"HSCAN", state.key, state.hscan_cursor, "MATCH", bind.hscan_pattern, "COUNT", count}, true);
+			auto reply = state.conn->Execute(
+			    {"HSCAN", state.key, state.hscan_cursor, "MATCH", bind.hscan_pattern, "COUNT", count}, context, true);
 			if (reply.IsError()) {
 				// Keys matching the pattern that aren't hashes are skipped
 				if (reply.str.rfind("WRONGTYPE", 0) != 0) {
@@ -878,7 +1727,8 @@ static void RedisHScanOverScanFunction(ClientContext &context, TableFunctionInpu
 		}
 		// Fetch the next SCAN page
 		if (!state.scan_done) {
-			auto reply = state.conn->execute({"SCAN", state.scan_cursor, "MATCH", bind.scan_pattern, "COUNT", count});
+			auto reply =
+			    state.conn->Execute({"SCAN", state.scan_cursor, "MATCH", bind.scan_pattern, "COUNT", count}, context);
 			reply.AsScanReply(state.scan_cursor, state.keys);
 			state.key_idx = 0;
 			state.scan_done = state.scan_cursor == "0";
@@ -895,7 +1745,7 @@ struct RedisKeysBindData : public RedisTableBindData {
 };
 
 struct RedisKeysState : public GlobalTableFunctionState {
-	std::shared_ptr<RedisConnection> conn;
+	std::unique_ptr<RedisSession> conn;
 	std::string cursor = "0";
 	bool scan_done = false;
 	std::vector<std::string> keys;
@@ -915,7 +1765,7 @@ static unique_ptr<FunctionData> RedisKeysBind(ClientContext &context, TableFunct
 
 static unique_ptr<GlobalTableFunctionState> RedisKeysInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<RedisKeysState>();
-	state->conn = input.bind_data->Cast<RedisKeysBindData>().Connect();
+	state->conn = input.bind_data->Cast<RedisKeysBindData>().Connect(context);
 	return std::move(state);
 }
 
@@ -935,7 +1785,7 @@ static void RedisKeysFunction(ClientContext &context, TableFunctionInput &data_p
 		if (state.scan_done) {
 			break;
 		}
-		auto reply = state.conn->execute({"SCAN", state.cursor, "MATCH", bind.pattern, "COUNT", "100"});
+		auto reply = state.conn->Execute({"SCAN", state.cursor, "MATCH", bind.pattern, "COUNT", "100"}, context);
 		reply.AsScanReply(state.cursor, state.keys);
 		state.key_idx = 0;
 		state.scan_done = state.cursor == "0";
@@ -945,24 +1795,18 @@ static void RedisKeysFunction(ClientContext &context, TableFunctionInput &data_p
 
 // Shared state for table functions that fetch one reply and emit it
 struct RedisFetchState : public GlobalTableFunctionState {
-	std::shared_ptr<RedisConnection> conn;
+	std::unique_ptr<RedisSession> conn;
 	std::vector<std::string> values;
 	size_t idx = 0;
 	bool fetched = false;
+	// Index of the first value (redis_lrange_table)
+	int64_t base_index = 0;
 };
 
 static unique_ptr<GlobalTableFunctionState> RedisFetchInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<RedisFetchState>();
-	state->conn = input.bind_data->Cast<RedisTableBindData>().Connect();
+	state->conn = input.bind_data->Cast<RedisTableBindData>().Connect(context);
 	return std::move(state);
-}
-
-static std::vector<std::string> ReplyStrings(const RedisReply &reply) {
-	std::vector<std::string> values;
-	for (auto &element : reply.AsArray()) {
-		values.push_back(element.AsString());
-	}
-	return values;
 }
 
 // redis_hgetall(key, secret) -> (field, value)
@@ -984,7 +1828,7 @@ static void RedisHGetAllFunction(ClientContext &context, TableFunctionInput &dat
 	auto &bind = data_p.bind_data->Cast<RedisHGetAllBindData>();
 	auto &state = data_p.global_state->Cast<RedisFetchState>();
 	if (!state.fetched) {
-		state.values = ReplyStrings(state.conn->execute({"HGETALL", bind.key}));
+		state.values = ReplyStrings(state.conn->Execute({"HGETALL", bind.key}, context));
 		state.fetched = true;
 	}
 	idx_t out_row = 0;
@@ -1020,13 +1864,28 @@ static void RedisLRangeTableFunction(ClientContext &context, TableFunctionInput 
 	auto &bind = data_p.bind_data->Cast<RedisLRangeTableBindData>();
 	auto &state = data_p.global_state->Cast<RedisFetchState>();
 	if (!state.fetched) {
-		state.values = ReplyStrings(
-		    state.conn->execute({"LRANGE", bind.key, std::to_string(bind.start), std::to_string(bind.stop)}));
+		std::vector<RedisCommand> commands;
+		if (bind.start < 0) {
+			// A negative start counts from the end; the list length gives the index of the first element
+			commands.push_back({"LLEN", bind.key});
+		}
+		commands.push_back({"LRANGE", bind.key, std::to_string(bind.start), std::to_string(bind.stop)});
+		auto replies = state.conn->ExecuteMany(commands, context);
+		for (auto &reply : replies) {
+			if (reply.IsError()) {
+				throw InvalidInputException("Redis error: %s", reply.str);
+			}
+		}
+		state.base_index = bind.start;
+		if (bind.start < 0) {
+			state.base_index = std::max<int64_t>(0, replies[0].AsInteger() + bind.start);
+		}
+		state.values = ReplyStrings(replies.back());
 		state.fetched = true;
 	}
 	idx_t out_row = 0;
 	for (; state.idx < state.values.size() && out_row < STANDARD_VECTOR_SIZE; state.idx++, out_row++) {
-		SetOutputValue(output, 0, out_row, Value::BIGINT(NumericCast<int64_t>(state.idx)));
+		SetOutputValue(output, 0, out_row, Value::BIGINT(state.base_index + NumericCast<int64_t>(state.idx)));
 		SetOutputValue(output, 1, out_row, Value(state.values[state.idx]));
 	}
 	SetOutputCardinality(output, out_row);
@@ -1035,6 +1894,13 @@ static void RedisLRangeTableFunction(ClientContext &context, TableFunctionInput 
 static void LoadInternal(ExtensionLoader &loader) {
 	// Register the secret functions first!
 	CreateRedisSecretFunctions::Register(loader);
+
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.AddExtensionOption(REDIS_TIMEOUT_SETTING,
+	                          "Timeout in milliseconds for connecting to Redis and for each wait for reply data (0 "
+	                          "waits forever; queries can still be interrupted). A redis secret's timeout_ms "
+	                          "overrides it",
+	                          LogicalType::BIGINT, Value::BIGINT(REDIS_DEFAULT_TIMEOUT_MS));
 
 	// DuckDB 2.0 names a parameter registered with a bare type "col<N>" in duckdb_functions(). Give each one its
 	// documented name instead; the parameters stay positional-only, so calls work exactly as before.
@@ -1125,8 +1991,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction("redis_lrange",
 	                   {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR},
 	                   LogicalType::VARCHAR, RedisLRangeFunction),
-	    "Get a range of elements from a Redis list. Returns elements as a comma-separated string. Use 0 for start and "
-	    "-1 for stop to get all elements.",
+	    "Get a range of elements from a Redis list. Returns elements as a comma-separated string, which is ambiguous "
+	    "when elements contain commas; prefer redis_lrange_list. Use 0 for start and -1 for stop to get all elements.",
 	    {"key", "start", "stop", "secret_name"},
 	    {"SELECT redis_lrange('mylist', 0, -1, 'my_redis_secret');",
 	     "SELECT redis_lrange('mylist', 0, 10, 'my_redis_secret');"});
@@ -1135,7 +2001,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	add_scalar_function(ScalarFunction("redis_mget", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
 	                                   RedisMGetFunction),
 	                    "Get the values of multiple keys from Redis. Keys should be comma-separated. Returns values as "
-	                    "a comma-separated string, with an empty entry for each key that does not exist.",
+	                    "a comma-separated string, with an empty entry for each key that does not exist; prefer "
+	                    "redis_mget_list, which keeps commas and missing keys unambiguous.",
 	                    {"keys", "secret_name"}, {"SELECT redis_mget('key1,key2,key3', 'my_redis_secret');"});
 
 	// Register redis_scan scalar function
@@ -1144,7 +2011,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                   {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR},
 	                   LogicalType::VARCHAR, RedisScanFunction),
 	    "Incrementally iterate over keys in Redis matching a pattern. Returns 'cursor:key1,key2,...'. Use cursor '0' "
-	    "to start, and continue until cursor returns '0'.",
+	    "to start, and continue until cursor returns '0'. Prefer redis_scan_page (typed result) or redis_keys.",
 	    {"cursor", "pattern", "count", "secret_name"},
 	    {"SELECT redis_scan('0', '*', 100, 'my_redis_secret');",
 	     "SELECT redis_scan('0', 'user:*', 10, 'my_redis_secret');"});
@@ -1155,9 +2022,69 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                    LogicalType::BIGINT, LogicalType::VARCHAR},
 	                                   LogicalType::VARCHAR, RedisHScanFunction),
 	                    "Incrementally iterate over fields in a Redis hash matching a pattern. Returns "
-	                    "'cursor:field1=value1,field2=value2,...'.",
+	                    "'cursor:field1=value1,field2=value2,...'. Prefer redis_hscan_page (typed result).",
 	                    {"key", "cursor", "pattern", "count", "secret_name"},
 	                    {"SELECT redis_hscan('myhash', '0', '*', 100, 'my_redis_secret');"});
+
+	add_scalar_function(
+	    ScalarFunction("redis_lrange_list",
+	                   {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR},
+	                   LogicalType::LIST(LogicalType::VARCHAR), RedisLRangeListFunction),
+	    "Get a range of elements from a Redis list as a VARCHAR[]. start and stop are zero-based and inclusive; "
+	    "negative values count from the end (0, -1 is the whole list). An empty list when the key does not exist.",
+	    {"key", "start", "stop", "secret_name"},
+	    {"SELECT redis_lrange_list('mylist', 0, -1, 'my_redis_secret');",
+	     "SELECT unnest(redis_lrange_list('mylist', 0, 9, 'my_redis_secret')) AS value;"});
+
+	add_scalar_function(
+	    ScalarFunction("redis_mget_list", {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
+	                   LogicalType::LIST(LogicalType::VARCHAR), RedisMGetListFunction),
+	    "Get the values of multiple keys from Redis in one round trip. Takes the keys as a VARCHAR[] and returns a "
+	    "VARCHAR[] of the same length, with NULL for each key that does not exist.",
+	    {"keys", "secret_name"},
+	    {"SELECT redis_mget_list(['key1', 'key2', 'key3'], 'my_redis_secret');",
+	     "SELECT redis_mget_list(list(key), 'my_redis_secret') FROM my_keys;"});
+
+	add_scalar_function(
+	    ScalarFunction("redis_scan_page",
+	                   {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR},
+	                   ScanPageType(), RedisScanPageFunction),
+	    "Run one SCAN step over the keys matching a pattern. Returns STRUCT(cursor VARCHAR, keys VARCHAR[]); start "
+	    "with cursor '0' and continue with the returned cursor until it is '0' again. A key may be returned more "
+	    "than once. redis_keys does the whole iteration as a table function.",
+	    {"cursor", "pattern", "count", "secret_name"},
+	    {"SELECT redis_scan_page('0', 'user:*', 100, 'my_redis_secret');",
+	     "SELECT unnest(redis_scan_page('0', '*', 1000, 'my_redis_secret').keys) AS key;"});
+
+	add_scalar_function(ScalarFunction("redis_hscan_page",
+	                                   {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                    LogicalType::BIGINT, LogicalType::VARCHAR},
+	                                   HScanPageType(), RedisHScanPageFunction),
+	                    "Run one HSCAN step over the fields of a Redis hash matching a pattern. Returns "
+	                    "STRUCT(cursor VARCHAR, entries MAP(VARCHAR, VARCHAR)); continue with the returned cursor "
+	                    "until it is '0'.",
+	                    {"key", "cursor", "pattern", "count", "secret_name"},
+	                    {"SELECT redis_hscan_page('myhash', '0', '*', 100, 'my_redis_secret');",
+	                     "SELECT redis_hscan_page('myhash', '0', '*', 100, 'my_redis_secret').entries['field1'];"});
+
+	add_scalar_function(ScalarFunction("redis_hgetall_map", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                   StringMapType(), RedisHGetAllMapFunction),
+	                    "Get all fields and values of a Redis hash as a MAP(VARCHAR, VARCHAR). An empty map when the "
+	                    "key does not exist.",
+	                    {"key", "secret_name"},
+	                    {"SELECT redis_hgetall_map('myhash', 'my_redis_secret');",
+	                     "SELECT id, redis_hgetall_map('user:' || id, 'my_redis_secret')['name'] FROM users;"});
+
+	add_scalar_function(
+	    ScalarFunction("redis_command", {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::VARCHAR},
+	                   LogicalType::VARCHAR, RedisCommandFunction),
+	    "Run any Redis command, given as a VARCHAR[] of the command name and its arguments. Strings and integers "
+	    "are returned as text, nil as NULL, and array replies as JSON arrays. Error replies raise an error. The "
+	    "connection is not reused afterwards, since the command may change its state.",
+	    {"args", "secret_name"},
+	    {"SELECT redis_command(['SADD', 'myset', 'a'], 'my_redis_secret');",
+	     "SELECT redis_command(['SMEMBERS', 'myset'], 'my_redis_secret')::JSON;",
+	     "SELECT redis_command(['INCRBY', 'counter', '5'], 'my_redis_secret')::BIGINT;"});
 
 	// Register redis_del scalar function
 	add_scalar_function(ScalarFunction("redis_del", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
@@ -1229,7 +2156,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    TableFunction("redis_lrange_table",
 	                  {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR},
 	                  RedisLRangeTableFunction, RedisLRangeTableBind, RedisFetchInit),
-	    "Get a range of elements from a Redis list as a table. Returns a table with 'index' and 'value' columns.",
+	    "Get a range of elements from a Redis list as a table. Returns a table with 'index' (the element's position "
+	    "in the list) and 'value' columns.",
 	    {"key", "start", "stop", "secret_name"},
 	    {"SELECT * FROM redis_lrange_table('mylist', 0, -1, 'my_redis_secret');"});
 
@@ -1244,7 +2172,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {"scan_pattern", "hscan_pattern", "count", "secret_name"},
 	    {"SELECT * FROM redis_hscan_over_scan('user:*', '*', 100, 'my_redis_secret');"});
 
-	QueryFarmSendTelemetry(loader, "redis", "2026102102");
+	QueryFarmSendTelemetry(loader, "redis", REDIS_EXTENSION_VERSION);
 }
 
 void RedisExtension::Load(ExtensionLoader &loader) {
@@ -1256,7 +2184,7 @@ std::string RedisExtension::Name() {
 }
 
 std::string RedisExtension::Version() const {
-	return "2026102102";
+	return REDIS_EXTENSION_VERSION;
 }
 
 } // namespace duckdb

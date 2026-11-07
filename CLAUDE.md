@@ -35,8 +35,10 @@ When making changes the version should always be updated to the current date plu
 
 - `src/redis_extension.cpp` - Main extension code containing:
   - `RedisProtocol` class: Redis RESP protocol formatting/parsing
-  - `RedisConnection` class: TCP socket connection management via Boost.Asio
-  - `ConnectionPool` class: Singleton connection pooling
+  - `RedisReplyParser` class: incremental RESP2/RESP3 parser (linear-time completeness scan, bounded counts/lengths)
+  - `RedisConnection` class: asynchronous Boost.Asio I/O with timeouts and interrupt checks, pipelining
+  - `RedisConnectionPool` / `RedisSession`: per-database idle-connection pool (object cache); connections are checked
+    out for exclusive use and retried once when a pooled connection went stale
   - All scalar and table function implementations (redis_get, redis_set, redis_hget, etc.)
 - `src/redis_secret.cpp` - DuckDB secret type registration for storing Redis connection credentials
 - `src/include/` - Header files
@@ -51,13 +53,21 @@ When making changes the version should always be updated to the current date plu
 
 ## Architecture Notes
 
-- Extension registers a `redis` secret type that stores host, port, and password
+- Extension registers a `redis` secret type: host, port (required), password, username (ACL), db, timeout_ms
 - All Redis functions take a secret name as the last parameter to identify which connection to use
-- Connection pooling is per host:port combination
+- Connections are pooled per database instance, keyed by host, port, credentials and db index
+- Every function refuses when `enable_external_access` is false; `redis_timeout_ms` bounds connects and reply waits
+- Scalar functions pipeline the commands of a chunk (one round trip per distinct secret)
 - Redis protocol is implemented directly (no external Redis client library)
-- Scalar functions: `redis_get`, `redis_set`, `redis_hget`, `redis_hset`, `redis_lpush`, `redis_lrange`, `redis_mget`, `redis_scan`, `redis_hscan`, `redis_del`, `redis_exists`, `redis_type`
+- Scalar functions: `redis_get`, `redis_set`, `redis_hget`, `redis_hset`, `redis_lpush`, `redis_lrange`, `redis_lrange_list`, `redis_mget`, `redis_mget_list`, `redis_scan`, `redis_scan_page`, `redis_hscan`, `redis_hscan_page`, `redis_hgetall_map`, `redis_command`, `redis_del`, `redis_exists`, `redis_type`, `redis_expire`, `redis_expireat`, `redis_ttl`
 - Table functions: `redis_keys`, `redis_hgetall`, `redis_lrange_table`, `redis_hscan_over_scan`
 
 ## Testing
 
-Tests use DuckDB's SQLLogicTest format. Test files are in `test/sql/`. The current test file needs updating as it references a `quack` extension (template leftover).
+Tests use DuckDB's SQLLogicTest format. Test files are in `test/sql/`. The default suite is offline. The live tests
+(`redis_server.test`, `redis_server_features.test`) run when `REDIS_TEST_PORT` and `REDIS_TEST_PASSWORD` are set:
+
+```sh
+redis-server --port 16379 --requirepass testpw --save "" --daemonize yes
+REDIS_TEST_PORT=16379 REDIS_TEST_PASSWORD=testpw ./build/release/test/unittest "test/sql/*"
+```

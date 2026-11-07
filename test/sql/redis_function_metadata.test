@@ -1,0 +1,29 @@
+# name: test/sql/redis_function_metadata.test
+# description: every redis function has a description, examples, categories and named parameters
+# group: [redis]
+
+require redis
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'redis%' AND function_type IN ('scalar', 'table');
+----
+25
+
+query I
+SELECT function_name FROM duckdb_functions()
+WHERE function_name LIKE 'redis%' AND function_type IN ('scalar', 'table')
+  AND (description IS NULL OR description = '' OR len(examples) = 0 OR len(categories) = 0
+       OR list_any_value(list_filter(parameters, lambda p: p LIKE 'col%')) IS NOT NULL)
+ORDER BY function_name;
+----
+
+# every scalar function talks to a server, so none may be constant-folded
+query I
+SELECT function_name FROM duckdb_functions()
+WHERE function_name LIKE 'redis%' AND function_type = 'scalar' AND stability <> 'VOLATILE';
+----
+
+query I
+SELECT value FROM duckdb_settings() WHERE name = 'redis_timeout_ms';
+----
+30000

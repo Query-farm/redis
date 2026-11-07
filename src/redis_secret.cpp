@@ -17,6 +17,12 @@ static void RegisterCommonSecretParameters(CreateSecretFunction &function) {
 	function.named_parameters["host"] = LogicalType::VARCHAR;
 	function.named_parameters["port"] = LogicalType::VARCHAR;
 	function.named_parameters["password"] = LogicalType::VARCHAR;
+	// Redis 6+ ACL user; requires a password
+	function.named_parameters["username"] = LogicalType::VARCHAR;
+	// Database index selected after connecting (default 0)
+	function.named_parameters["db"] = LogicalType::BIGINT;
+	// Connect / reply timeout in milliseconds, overriding the redis_timeout_ms setting (0 = no timeout)
+	function.named_parameters["timeout_ms"] = LogicalType::BIGINT;
 }
 
 static void RedactCommonKeys(KeyValueSecret &result) {
@@ -32,6 +38,9 @@ static unique_ptr<BaseSecret> CreateRedisSecretFromConfig(ClientContext &context
 	CopySecret("host", input, *result);
 	CopySecret("port", input, *result);
 	CopySecret("password", input, *result);
+	CopySecret("username", input, *result);
+	CopySecret("db", input, *result);
+	CopySecret("timeout_ms", input, *result);
 
 	// Redact sensitive keys
 	RedactCommonKeys(*result);

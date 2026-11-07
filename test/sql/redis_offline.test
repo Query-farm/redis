@@ -1,0 +1,159 @@
+# name: test/sql/redis_offline.test
+# description: connection settings, timeouts and sandboxing, without a Redis server
+# group: [redis]
+
+require redis
+
+statement ok
+CREATE SECRET redis_closed (TYPE redis, host '127.0.0.1', port '1');
+
+# ---- connection refused is reported, for scalar and table functions ----
+
+statement error
+SELECT redis_get('k', 'redis_closed');
+----
+Redis connection error
+
+statement error
+SELECT * FROM redis_hgetall('k', 'redis_closed');
+----
+Redis connection error
+
+# the new typed functions go through the same path
+statement error
+SELECT redis_mget_list(['a', 'b'], 'redis_closed');
+----
+Redis connection error
+
+statement error
+SELECT redis_command(['PING'], 'redis_closed');
+----
+Redis connection error
+
+# ---- NULL arguments give NULL without connecting ----
+
+query IIII
+SELECT redis_get(NULL, 'redis_closed'), redis_lrange_list(NULL, 0, -1, 'redis_closed'), redis_mget_list(NULL, 'redis_closed'), redis_scan_page(NULL, '*', 10, 'redis_closed');
+----
+NULL	NULL	NULL	NULL
+
+query I
+SELECT count(*) FROM (SELECT redis_get(k, 'redis_closed') AS v FROM (VALUES (NULL::VARCHAR), (NULL)) t(k)) WHERE v IS NULL;
+----
+2
+
+# ---- secret options ----
+
+statement ok
+CREATE SECRET redis_user_nopass (TYPE redis, host '127.0.0.1', port '1', username 'alice');
+
+statement error
+SELECT redis_get('k', 'redis_user_nopass');
+----
+sets 'username' but no 'password'
+
+statement ok
+CREATE SECRET redis_bad_db (TYPE redis, host '127.0.0.1', port '1', db -1);
+
+statement error
+SELECT redis_get('k', 'redis_bad_db');
+----
+'db' must be 0 or greater
+
+statement ok
+CREATE SECRET redis_bad_timeout (TYPE redis, host '127.0.0.1', port '1', timeout_ms -5);
+
+statement error
+SELECT redis_get('k', 'redis_bad_timeout');
+----
+Redis timeout must be 0
+
+statement error
+SET redis_timeout_ms = 'soon';
+----
+
+statement ok
+SET redis_timeout_ms = 250;
+
+query I
+SELECT current_setting('redis_timeout_ms');
+----
+250
+
+# the password stays redacted
+statement ok
+CREATE SECRET redis_pw (TYPE redis, host '127.0.0.1', port '1', password 'hunter2', username 'bob', db 3, timeout_ms 100);
+
+query II
+SELECT secret_string LIKE '%hunter2%', secret_string LIKE '%db=3%' FROM duckdb_secrets() WHERE name = 'redis_pw';
+----
+false	true
+
+# ---- a secret of another type is reported as such ----
+
+statement ok
+CREATE SECRET not_redis (TYPE http, bearer_token 'x');
+
+statement error
+SELECT redis_get('k', 'not_redis');
+----
+Invalid secret type. Expected 'redis', got 'http'
+
+# ---- malformed list arguments ----
+
+statement error
+SELECT redis_mget_list(['a', NULL], 'redis_closed');
+----
+must not contain NULL
+
+statement error
+SELECT redis_command([], 'redis_closed');
+----
+needs at least the command name
+
+# an empty key list needs no round trip
+query I
+SELECT redis_mget_list([], 'redis_closed');
+----
+[]
+
+# ---- connect timeout: TEST-NET-1 (RFC 5737) is never routed, so the connect hangs until the timeout ----
+# (some networks reject it right away instead, which is reported as a connection error too)
+
+statement ok
+CREATE SECRET redis_blackhole (TYPE redis, host '192.0.2.1', port '6379', timeout_ms 300);
+
+statement error
+SELECT redis_get('k', 'redis_blackhole');
+----
+<REGEX>:.*Redis connection error: .*(timed out connecting after 300 ms|unreachable|refused).*
+
+statement error
+SELECT * FROM redis_keys('*', 'redis_blackhole');
+----
+<REGEX>:.*Redis connection error: .*(timed out connecting after 300 ms|unreachable|refused).*
+
+# ---- enable_external_access = false refuses every redis function ----
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+SELECT redis_get('k', 'redis_closed');
+----
+Permission Error: Redis functions are disabled because enable_external_access is false
+
+statement error
+SELECT redis_command(['PING'], 'redis_closed');
+----
+enable_external_access is false
+
+statement error
+SELECT * FROM redis_keys('*', 'redis_closed');
+----
+enable_external_access is false
+
+statement error
+SELECT * FROM redis_lrange_table('k', 0, -1, 'redis_closed');
+----
+enable_external_access is false
